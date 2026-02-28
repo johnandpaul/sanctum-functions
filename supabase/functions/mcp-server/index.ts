@@ -95,6 +95,57 @@ server.registerTool('get_inbox', {
   return { content: [{ type: "text", text: files || "Inbox is empty" }] };
 })
 
+server.registerTool('save_artifact', {
+  title: 'Save Artifact',
+  description: "Save an artifact, document, specification, or reference material to John's Obsidian vault. Use when John wants to save a document, spec, design, diagram description, or any structured reference content. Files to 03-resources unless a project is specified.",
+  inputSchema: {
+    title: z.string().describe("Short descriptive title for the artifact"),
+    content: z.string().describe("The full content of the artifact"),
+    summary: z.string().describe("2-3 sentence description of what this artifact is and why it matters"),
+    project: z.string().optional().describe("Project: sigyls, dallas-tub-fix, sanctum, or leave empty for general resources"),
+    tags: z.array(z.string()).optional().describe("Hierarchical tags like sigyls/architecture or sigyls/ux-design"),
+    artifact_type: z.string().optional().describe("Type of artifact: spec, design, diagram, research, template, other")
+  }
+}, async ({ title, summary, content, project, tags, artifact_type }) => {
+  const today = new Date().toISOString().split("T")[0];
+  const tagList = tags ? tags.join(", ") : "";
+  const folder = project
+    ? `01-projects/${project}`
+    : `03-resources`;
+
+  const note = `---
+type: resource
+artifact_type: ${artifact_type || "other"}
+status: active
+tags: [${tagList}]
+created: ${today}
+source: claude-chat
+project: ${project || ""}
+---
+
+# ${title}
+
+## Summary
+${summary}
+
+## Content
+${content}
+`;
+
+  const fileName = `${folder}/${today}-${title.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "")}.md`;
+  const response = await fetch(`${OBSIDIAN_API_URL}/vault/${fileName}`, {
+    method: "PUT",
+    headers: {
+      "Authorization": `Bearer ${OBSIDIAN_API_KEY}`,
+      "Content-Type": "text/markdown",
+    },
+    body: note,
+  });
+  return {
+    content: [{ type: "text", text: response.ok ? `✅ Artifact saved to: ${fileName}` : `❌ Failed to save artifact` }]
+  };
+})
+
 server.registerTool('file_note', {
   title: 'File Note',
   description: "Move a note from the inbox to the correct PARA folder based on its project. Use when saving a note that belongs to a specific project rather than dropping it in inbox.",
