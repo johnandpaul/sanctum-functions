@@ -186,7 +186,9 @@ When done reviewing, say "apply approved gap connections" in Claude.
   <li><strong>Connections proposed:</strong> ${analysis.proposed_connections.length}</li>
   <li><strong>Orphaned notes:</strong> ${analysis.orphaned_notes.length}</li>
 </ul>
-<p>Open Obsidian and check your inbox for <strong>${today}-gap-analysis.md</strong> to review and approve connections.</p>`
+<p>Open Obsidian and check your inbox for <strong>${today}-gap-analysis.md</strong> to review and approve connections.</p>
+<p>When ready, tap below to apply all approved connections:</p>
+<p><a href="https://ozezxrmaoukpqjshimys.supabase.co/functions/v1/apply-gap-connections" style="background:#6366f1;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600;">Apply Gap Connections</a></p>`
       })
     });
 
