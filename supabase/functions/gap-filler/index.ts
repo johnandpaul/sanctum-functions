@@ -167,6 +167,28 @@ When done reviewing, say "apply approved gap connections" in Claude.
         headers: { "Content-Type": "application/json" }
       });
     }
+    
+    // Send email notification via Resend
+    const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY")!;
+    await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${RESEND_API_KEY}`
+      },
+      body: JSON.stringify({
+        from: 'Sanctum <sanctum@dallastubfix.com>',
+        to: 'johnandpaul42@gmail.com',
+        subject: `🔗 Gap Analysis Ready — ${analysis.proposed_connections.length} connections found`,
+        html: `<p>Your weekly vault analysis is complete.</p>
+<ul>
+  <li><strong>Notes analyzed:</strong> ${notes.length}</li>
+  <li><strong>Connections proposed:</strong> ${analysis.proposed_connections.length}</li>
+  <li><strong>Orphaned notes:</strong> ${analysis.orphaned_notes.length}</li>
+</ul>
+<p>Open Obsidian and check your inbox for <strong>${today}-gap-analysis.md</strong> to review and approve connections.</p>`
+      })
+    });
 
     return new Response(JSON.stringify({
       success: true,
