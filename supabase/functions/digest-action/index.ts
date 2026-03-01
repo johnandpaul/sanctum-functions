@@ -12,20 +12,11 @@ const FOLDER_MAP: Record<string, string> = {
 };
 
 function successPage(message: string): Response {
-  return new Response(`<!DOCTYPE html>
-<html>
-<head>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Sanctum</title>
-</head>
-<body style="background:#0f172a;margin:0;padding:40px 20px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;text-align:center;">
-  <div style="max-width:400px;margin:0 auto;">
-    <div style="font-size:48px;margin-bottom:16px;">✅</div>
-    <h2 style="color:#f1f5f9;margin:0 0 8px;">${message}</h2>
-    <p style="color:#64748b;margin:0;">You can close this tab.</p>
-  </div>
-</body>
-</html>`, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+  const redirectUrl = `https://johnandpaul.github.io/sanctum-functions/success.html?message=${encodeURIComponent(message)}`;
+  return new Response(null, {
+    status: 302,
+    headers: { "Location": redirectUrl }
+  });
 }
 
 function newTopicPage(params: URLSearchParams): Response {
@@ -83,7 +74,7 @@ Deno.serve(async (req) => {
   const whyItMatters = params.get('why') || '';
   const recommendedAction = params.get('rec') || '';
 
-  const today = new Date().toISOString().split("T")[0];
+  const today = new Date().toLocaleString("en-CA", { timeZone: "America/Chicago" }).split(",")[0];
   const safeTitle = headline.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "").slice(0, 60);
   const fileName = `${today}-digest-${safeTitle}.md`;
 
