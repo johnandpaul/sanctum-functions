@@ -95,6 +95,44 @@ server.registerTool('get_inbox', {
   return { content: [{ type: "text", text: files || "Inbox is empty" }] };
 })
 
+server.registerTool('browse_vault', {
+  title: 'Browse Vault',
+  description: "Browse John's Obsidian vault folder structure and file tree. Use to explore what notes and folders exist, navigate the PARA structure, or find notes before reading them.",
+  inputSchema: {
+    folder: z.string().optional().describe("Folder path to browse, e.g. '01-projects/sigyls/' or leave empty for root")
+  }
+}, async ({ folder }) => {
+  const path = folder ? `${folder.replace(/\/$/, '')}/` : '';
+  const response = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  });
+  if (!response.ok) return { content: [{ type: "text", text: `❌ Could not browse: ${path || 'root'}` }] };
+  const data = await response.json();
+  const files = data.files || [];
+  const folders = files.filter((f: string) => f.endsWith('/'));
+  const notes = files.filter((f: string) => !f.endsWith('/'));
+  return {
+    content: [{ type: "text", text: `📁 ${path || 'vault root'}\n\nFolders:\n${folders.map((f: string) => `  📁 ${f}`).join('\n') || '  (none)'}\n\nNotes:\n${notes.map((f: string) => `  📄 ${f}`).join('\n') || '  (none)'}` }]
+  };
+})
+
+server.registerTool('read_note', {
+  title: 'Read Note',
+  description: "Read the full contents of a specific note in John's Obsidian vault by its path. Use after browse_vault to read a specific note.",
+  inputSchema: {
+    path: z.string().describe("Full path to the note, e.g. '01-projects/sigyls/2026-02-28-ada-design.md'")
+  }
+}, async ({ path }) => {
+  const response = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  });
+  if (!response.ok) return { content: [{ type: "text", text: `❌ Note not found: ${path}` }] };
+  const content = await response.text();
+  return {
+    content: [{ type: "text", text: `📄 ${path}\n\n${content}` }]
+  };
+})
+
 server.registerTool('save_artifact', {
   title: 'Save Artifact',
   description: "Save an artifact, document, specification, or reference material to John's Obsidian vault. Use when John wants to save a document, spec, design, diagram description, or any structured reference content. Files to 03-resources unless a project is specified.",
