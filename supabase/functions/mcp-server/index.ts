@@ -232,6 +232,29 @@ server.registerTool('file_note', {
   };
 })
 
+server.registerTool('semantic_search', {
+  title: 'Semantic Search',
+  description: "Search John's Obsidian vault by meaning rather than keywords. Finds notes that are conceptually related to the query even if they don't contain the exact words.",
+  inputSchema: {
+    query: z.string().describe("The concept or question to search for"),
+    limit: z.number().optional().describe("Number of results to return, default 5"),
+    project: z.string().optional().describe("Filter by project: sigyls, dallas-tub-fix, sanctum, sono, turnkey")
+  }
+}, async ({ query, limit = 5, project }) => {
+  const response = await fetch('https://ozezxrmaoukpqjshimys.supabase.co/functions/v1/semantic-search', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query, limit, project: project || null })
+  })
+  if (!response.ok) return { content: [{ type: "text", text: "❌ Semantic search failed" }] }
+  const data = await response.json()
+  if (!data.results?.length) return { content: [{ type: "text", text: `No results found for: ${query}` }] }
+  const formatted = data.results.map((r: any) =>
+    `📄 ${r.path} (${Math.round(r.similarity * 100)}% match)\n${r.content.slice(0, 200)}...`
+  ).join('\n\n')
+  return { content: [{ type: "text", text: formatted }] }
+})
+
 server.registerTool('delete_note', {
   title: 'Delete Note',
   description: "Permanently delete a note from John's Obsidian vault. Use with caution — this is irreversible.",
