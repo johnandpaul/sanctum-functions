@@ -232,6 +232,52 @@ server.registerTool('file_note', {
   };
 })
 
+server.registerTool('edit_note', {
+  title: 'Edit Note',
+  description: "Edit an existing note in John's Obsidian vault. Can update frontmatter fields, append content, or find and replace specific text within a note.",
+  inputSchema: {
+    path: z.string().describe("Full path to the note, e.g. '01-projects/sigyls/2026-02-28-ada-design.md'"),
+    mode: z.string().describe("Edit mode: 'append' adds to end, 'find_replace' swaps text, 'frontmatter' updates a frontmatter field"),
+    content: z.string().optional().describe("Content to append (for append mode)"),
+    find: z.string().optional().describe("Text to find (for find_replace mode)"),
+    replace: z.string().optional().describe("Text to replace with (for find_replace mode)"),
+    field: z.string().optional().describe("Frontmatter field name to update (for frontmatter mode)"),
+    value: z.string().optional().describe("New value for the frontmatter field (for frontmatter mode)")
+  }
+}, async ({ path, mode, content, find, replace, field, value }) => {
+  const readResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  });
+  if (!readResponse.ok) return { content: [{ type: "text", text: `❌ Note not found: ${path}` }] };
+  let noteContent = await readResponse.text();
+
+  if (mode === "append" && content) {
+    noteContent = noteContent.trimEnd() + "\n\n" + content;
+  } else if (mode === "find_replace" && find && replace !== undefined) {
+    if (!noteContent.includes(find)) return { content: [{ type: "text", text: `❌ Text not found in note: "${find}"` }] };
+    noteContent = noteContent.replace(find, replace);
+  } else if (mode === "frontmatter" && field && value !== undefined) {
+    const regex = new RegExp(`^(${field}:\\s*)(.+)$`, "m");
+    if (!regex.test(noteContent)) return { content: [{ type: "text", text: `❌ Frontmatter field not found: "${field}"` }] };
+    noteContent = noteContent.replace(regex, `$1${value}`);
+  } else {
+    return { content: [{ type: "text", text: "❌ Invalid parameters for selected mode" }] };
+  }
+
+  const writeResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+    method: "PUT",
+    headers: {
+      "Authorization": `Bearer ${OBSIDIAN_API_KEY}`,
+      "Content-Type": "text/markdown",
+    },
+    body: noteContent,
+  });
+
+  return {
+    content: [{ type: "text", text: writeResponse.ok ? `✅ Note updated: ${path}` : `❌ Failed to update note` }]
+  };
+})
+
 server.registerTool('organize_inbox', {
   title: 'Organize Inbox',
   description: "Automatically file all notes in the vault inbox to their correct PARA folders based on their project frontmatter tags. Use when John says 'organize my inbox' or 'file my notes'.",
