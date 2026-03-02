@@ -6,6 +6,7 @@ import { z } from 'npm:zod@^4.1.13'
 
 const OBSIDIAN_API_URL = Deno.env.get("OBSIDIAN_API_URL")!;
 const OBSIDIAN_API_KEY = Deno.env.get("OBSIDIAN_API_KEY")!;
+const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
 
 const app = new Hono()
 const server = new McpServer({ name: 'sanctum-vault', version: '1.0.0' })
@@ -62,8 +63,8 @@ ${raw || ""}
   });
   if (response.ok) {
     await fetch('https://ozezxrmaoukpqjshimys.supabase.co/functions/v1/embed-note', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SUPABASE_ANON_KEY}` },
       body: JSON.stringify({ path: fileName, content: note, project: project || '' })
     })
   }
@@ -189,8 +190,8 @@ ${content}
   });
   if (response.ok) {
     await fetch('https://ozezxrmaoukpqjshimys.supabase.co/functions/v1/embed-note', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SUPABASE_ANON_KEY}` },
       body: JSON.stringify({ path: fileName, content: note, project: project || '' })
     })
   }
@@ -330,8 +331,8 @@ server.registerTool('edit_note', {
 
   if (writeResponse.ok) {
     await fetch('https://ozezxrmaoukpqjshimys.supabase.co/functions/v1/embed-note', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SUPABASE_ANON_KEY}` },
       body: JSON.stringify({ path, content: noteContent, project: '' })
     })
   }
