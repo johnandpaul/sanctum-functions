@@ -232,6 +232,22 @@ server.registerTool('file_note', {
   };
 })
 
+server.registerTool('delete_note', {
+  title: 'Delete Note',
+  description: "Permanently delete a note from John's Obsidian vault. Use with caution — this is irreversible.",
+  inputSchema: {
+    path: z.string().describe("Full path to the note, e.g. '01-projects/sigyls/2026-03-01-old-note.md'")
+  }
+}, async ({ path }) => {
+  const response = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+    method: "DELETE",
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  });
+  return {
+    content: [{ type: "text", text: response.ok ? `🗑️ Deleted: ${path}` : `❌ Failed to delete: ${path} (status ${response.status})` }]
+  };
+})
+
 server.registerTool('edit_note', {
   title: 'Edit Note',
   description: "Edit an existing note in John's Obsidian vault. Can update frontmatter fields, append content, or find and replace specific text within a note.",
