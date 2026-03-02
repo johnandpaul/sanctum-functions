@@ -60,6 +60,14 @@ ${raw || ""}
     },
     body: note,
   });
+  if (response.ok) {
+    await fetch('https://ozezxrmaoukpqjshimys.supabase.co/functions/v1/embed-note', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: fileName, content: note, project: project || '' })
+    })
+  }
+
   return {
     content: [{ type: "text", text: response.ok ? `✅ Saved to vault: ${fileName}` : `❌ Failed to save note` }]
   };
@@ -179,6 +187,14 @@ ${content}
     },
     body: note,
   });
+  if (response.ok) {
+    await fetch('https://ozezxrmaoukpqjshimys.supabase.co/functions/v1/embed-note', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: fileName, content: note, project: project || '' })
+    })
+  }
+
   return {
     content: [{ type: "text", text: response.ok ? `✅ Artifact saved to: ${fileName}` : `❌ Failed to save artifact` }]
   };
@@ -311,6 +327,14 @@ server.registerTool('edit_note', {
     },
     body: noteContent,
   });
+
+  if (writeResponse.ok) {
+    await fetch('https://ozezxrmaoukpqjshimys.supabase.co/functions/v1/embed-note', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path, content: noteContent, project: '' })
+    })
+  }
 
   return {
     content: [{ type: "text", text: writeResponse.ok ? `✅ Note updated: ${path}` : `❌ Failed to update note` }]
