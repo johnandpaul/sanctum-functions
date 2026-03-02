@@ -406,6 +406,26 @@ server.registerTool('organize_inbox', {
   return { content: [{ type: "text", text: results.join("\n") }] };
 })
 
+server.registerTool('run_gap_filler', {
+  title: 'Run Gap Filler',
+  description: "Trigger the gap filler agent to analyze John's Obsidian vault for missing connections between notes. Writes a gap analysis report to the vault inbox. Use when John says 'run the gap filler', 'analyze my vault', or 'find missing connections'.",
+  inputSchema: {}
+}, async () => {
+  const response = await fetch(`${Deno.env.get("SUPABASE_URL")!}/functions/v1/gap-filler`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || Deno.env.get("SANCTUM_ANON_KEY")!}`
+    }
+  });
+  const data = await response.json();
+  return {
+    content: [{ type: "text", text: response.ok
+      ? `✅ Gap filler complete — ${data.connections_proposed} connections proposed across ${data.notes_analyzed} notes. Check your inbox for the gap analysis note.`
+      : `❌ Gap filler failed: ${JSON.stringify(data)}` }]
+  };
+})
+
 app.all('*', async (c) => {
   const transport = new WebStandardStreamableHTTPServerTransport()
   await server.connect(transport)
