@@ -599,6 +599,153 @@ server.registerTool('run_gap_filler', {
   };
 })
 
+server.registerTool('move_note', {
+  title: 'Move Note',
+  description: "Move a note from any path to any destination in John's Obsidian vault. Use when John wants to reorganize or relocate a note.",
+  inputSchema: {
+    source_path: z.string().describe("Full source path, e.g. '00-inbox/2026-03-01-my-note.md'"),
+    destination_path: z.string().describe("Full destination path, e.g. '01-projects/sigyls/2026-03-01-my-note.md'")
+  }
+}, async ({ source_path, destination_path }) => {
+  const readResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${source_path}`, {
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  });
+  if (!readResponse.ok) return { content: [{ type: "text", text: `❌ Source not found: ${source_path}` }] };
+  const content = await readResponse.text();
+
+  const writeResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${destination_path}`, {
+    method: "PUT",
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}`, "Content-Type": "text/markdown" },
+    body: content,
+  });
+  if (!writeResponse.ok) return { content: [{ type: "text", text: `❌ Failed to write to: ${destination_path}` }] };
+
+  const deleteResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${source_path}`, {
+    method: "DELETE",
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  });
+
+  return {
+    content: [{ type: "text", text: deleteResponse.ok
+      ? `✅ Moved: ${source_path} → ${destination_path}`
+      : `⚠️ Copied to ${destination_path} but failed to delete source: ${source_path}` }]
+  };
+})
+
+server.registerTool('rename_note', {
+  title: 'Rename Note',
+  description: "Rename a note in place without moving it to a different folder in John's Obsidian vault.",
+  inputSchema: {
+    path: z.string().describe("Full current path, e.g. '01-projects/sigyls/2026-03-01-old-name.md'"),
+    new_name: z.string().describe("New filename only (no folder), e.g. 'my-new-name.md'")
+  }
+}, async ({ path, new_name }) => {
+  const folder = path.substring(0, path.lastIndexOf('/') + 1);
+  const new_path = folder + new_name;
+
+  const readResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  });
+  if (!readResponse.ok) return { content: [{ type: "text", text: `❌ Note not found: ${path}` }] };
+  const content = await readResponse.text();
+
+  const writeResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${new_path}`, {
+    method: "PUT",
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}`, "Content-Type": "text/markdown" },
+    body: content,
+  });
+  if (!writeResponse.ok) return { content: [{ type: "text", text: `❌ Failed to write to: ${new_path}` }] };
+
+  const deleteResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+    method: "DELETE",
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  });
+
+  return {
+    content: [{ type: "text", text: deleteResponse.ok
+      ? `✅ Renamed to: ${new_path}`
+      : `⚠️ Created ${new_path} but failed to delete original: ${path}` }]
+  };
+})
+
+server.registerTool('batch_update_frontmatter', {
+  title: 'Batch Update Frontmatter',
+  description: "Update a single frontmatter field to the same value across multiple notes at once. Use when John wants to bulk-update status, project, or any frontmatter field.",
+  inputSchema: {
+    paths: z.array(z.string()).describe("Array of full note paths to update"),
+    field: z.string().describe("Frontmatter field name to update, e.g. 'status'"),
+    value: z.string().describe("New value for the field, e.g. 'archived'")
+  }
+}, async ({ paths, field, value }) => {
+  const results: string[] = [];
+  for (const notePath of paths) {
+    const readResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${notePath}`, {
+      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+    });
+    if (!readResponse.ok) { results.push(`❌ Not found: ${notePath}`); continue; }
+    let noteContent = await readResponse.text();
+
+    const regex = new RegExp(`^(${field}:\\s*)(.+)$`, "m");
+    if (!regex.test(noteContent)) { results.push(`⚠️ Field "${field}" not found: ${notePath}`); continue; }
+    noteContent = noteContent.replace(regex, `$1${value}`);
+
+    const writeResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${notePath}`, {
+      method: "PUT",
+      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}`, "Content-Type": "text/markdown" },
+      body: noteContent,
+    });
+    results.push(writeResponse.ok ? `✅ Updated: ${notePath}` : `❌ Failed to write: ${notePath}`);
+  }
+  return { content: [{ type: "text", text: results.join("\n") }] };
+})
+
+server.registerTool('clean_note_structure', {
+  title: 'Clean Note Structure',
+  description: "Fix duplicate '## Related' sections in a note by consolidating all wikilinks into one deduplicated Related block at the end. Use when a note has scattered or repeated Related sections.",
+  inputSchema: {
+    path: z.string().describe("Full path to the note to clean, e.g. '01-projects/sigyls/2026-03-01-my-note.md'")
+  }
+}, async ({ path }) => {
+  const readResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  });
+  if (!readResponse.ok) return { content: [{ type: "text", text: `❌ Note not found: ${path}` }] };
+  const noteContent = await readResponse.text();
+
+  const relatedSectionRegex = /## Related\n([\s\S]*?)(?=\n## |$)/g;
+  const wikilinks = new Set<string>();
+  let sectionCount = 0;
+  let match;
+  while ((match = relatedSectionRegex.exec(noteContent)) !== null) {
+    sectionCount++;
+    const wikilinkRegex = /\[\[([^\]]+)\]\]/g;
+    let wlMatch;
+    while ((wlMatch = wikilinkRegex.exec(match[1])) !== null) {
+      wikilinks.add(`[[${wlMatch[1]}]]`);
+    }
+  }
+
+  if (sectionCount <= 1) {
+    return { content: [{ type: "text", text: `ℹ️ Only ${sectionCount} Related section found — nothing to clean in: ${path}` }] };
+  }
+
+  const cleaned = noteContent.replace(/\n## Related\n[\s\S]*?(?=\n## |$)/g, '');
+  const deduped = [...wikilinks];
+  const updated = cleaned.trimEnd() + '\n\n## Related\n' + (deduped.length ? deduped.join('\n') + '\n' : '');
+
+  const writeResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+    method: "PUT",
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}`, "Content-Type": "text/markdown" },
+    body: updated,
+  });
+
+  return {
+    content: [{ type: "text", text: writeResponse.ok
+      ? `✅ Cleaned: ${path}\n  ${sectionCount} Related sections → 1\n  ${deduped.length} unique wikilink${deduped.length !== 1 ? 's' : ''} preserved`
+      : `❌ Failed to write cleaned note` }]
+  };
+})
+
 app.all('*', async (c) => {
   const transport = new WebStandardStreamableHTTPServerTransport()
   await server.connect(transport)
