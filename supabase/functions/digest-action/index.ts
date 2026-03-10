@@ -7,6 +7,8 @@ const FOLDER_MAP: Record<string, string> = {
   "sigyls": "01-projects/sigyls",
   "dallas-tub-fix": "01-projects/dallas-tub-fix",
   "sanctum": "01-projects/sanctum",
+  "sono": "01-projects/sono",
+  "turnkey": "01-projects/turnkey",
   "archive": "04-archive/digest",
   "intelligence": "02-areas/intelligence",
 };
