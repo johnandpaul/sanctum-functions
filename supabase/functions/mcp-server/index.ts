@@ -33,6 +33,11 @@ tags: [${tagList}]
 created: ${today}
 source: claude-chat
 project: ${project || ""}
+source_chat_url: ""
+edit_history:
+  - date: ${today}
+    action: created
+    chat_url: ""
 ---
 
 # ${title}
@@ -153,6 +158,11 @@ tags: [${tagList}]
 created: ${today}
 source: claude-chat
 project: ${project || ""}
+source_chat_url: ""
+edit_history:
+  - date: ${today}
+    action: created
+    chat_url: ""
 ---
 
 # ${title}
