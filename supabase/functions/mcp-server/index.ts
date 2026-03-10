@@ -11,6 +11,28 @@ const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
 const app = new Hono()
 const server = new McpServer({ name: 'sanctum-vault', version: '1.0.0' })
 
+async function getAllVaultNotes(folderPath = ''): Promise<string[]> {
+  const urlPath = folderPath ? `${folderPath}/` : ''
+  const res = await fetch(`${OBSIDIAN_API_URL}/vault/${urlPath}`, {
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  })
+  if (!res.ok) return []
+  const data = await res.json()
+  const entries: string[] = data.files ?? []
+  const allNotes: string[] = []
+  for (const entry of entries) {
+    if (entry.endsWith('/')) {
+      const subfolderName = entry.slice(0, -1)
+      const subfolderPath = folderPath ? `${folderPath}/${subfolderName}` : subfolderName
+      const subNotes = await getAllVaultNotes(subfolderPath)
+      allNotes.push(...subNotes)
+    } else if (entry.endsWith('.md')) {
+      allNotes.push(folderPath ? `${folderPath}/${entry}` : entry)
+    }
+  }
+  return allNotes
+}
+
 server.registerTool('save_brainstorm', {
   title: 'Save Brainstorm',
   description: "Save a brainstorm or idea from a Claude chat directly to John's Obsidian vault inbox. Use this when John asks to save, capture, or send something to his vault.",
@@ -265,6 +287,13 @@ server.registerTool('edit_note', {
     noteContent = noteContent.replace(regex, `$1${value}`);
   } else {
     return { content: [{ type: "text", text: "❌ Invalid parameters for selected mode" }] };
+  }
+
+  const today = new Date().toISOString().split("T")[0];
+  const newHistoryEntry = `  - date: ${today}\n    action: edited\n    same_as_creator: false\n    chat_url: ""`;
+  const fmEnd = noteContent.indexOf('\n---\n', 3);
+  if (fmEnd !== -1 && noteContent.includes('edit_history:')) {
+    noteContent = noteContent.slice(0, fmEnd) + '\n' + newHistoryEntry + noteContent.slice(fmEnd);
   }
 
   const writeResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
@@ -778,28 +807,6 @@ server.registerTool('vault_health_check', {
   description: "Scan John's entire Obsidian vault and return a structured health report identifying: missing project frontmatter, duplicate Related sections, phantom folders (folder names that look like dated note titles), notes filed in wrong project folders, and sparse notes with minimal content.",
   inputSchema: {}
 }, async () => {
-  async function getAllVaultNotes(folderPath = ''): Promise<string[]> {
-    const urlPath = folderPath ? `${folderPath}/` : ''
-    const res = await fetch(`${OBSIDIAN_API_URL}/vault/${urlPath}`, {
-      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
-    })
-    if (!res.ok) return []
-    const data = await res.json()
-    const entries: string[] = data.files ?? []
-    const allNotes: string[] = []
-    for (const entry of entries) {
-      if (entry.endsWith('/')) {
-        const subfolderName = entry.slice(0, -1)
-        const subfolderPath = folderPath ? `${folderPath}/${subfolderName}` : subfolderName
-        const subNotes = await getAllVaultNotes(subfolderPath)
-        allNotes.push(...subNotes)
-      } else if (entry.endsWith('.md')) {
-        allNotes.push(folderPath ? `${folderPath}/${entry}` : entry)
-      }
-    }
-    return allNotes
-  }
-
   const allNotes = await getAllVaultNotes()
 
   const missingProject: string[] = []
@@ -1373,6 +1380,56 @@ server.registerTool('update_staging', {
   return {
     content: [{ type: "text", text: `✅ ${action === 'add' ? 'Added' : 'Removed'}: ${task}\n\n## Backlog\n${newLines.join('\n') || '(empty)'}` }]
   }
+})
+
+server.registerTool('home_protocol', {
+  title: 'Home Protocol',
+  description: "Scans today's notes to find which ones need chat URLs backfilled. Run this when John says 'I'm home'.",
+  inputSchema: {}
+}, async () => {
+  const today = new Date().toISOString().split("T")[0];
+  const allNotes = await getAllVaultNotes();
+  const needsUrls: { path: string, count: number, multiChat: boolean }[] = [];
+
+  for (const notePath of allNotes) {
+    const res = await fetch(`${OBSIDIAN_API_URL}/vault/${notePath}`, {
+      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+    });
+    if (!res.ok) continue;
+    const content = await res.text();
+
+    const isFromToday = content.includes(`created: ${today}`) || content.includes(`  - date: ${today}`);
+    if (!isFromToday) continue;
+
+    const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
+    if (!fmMatch) continue;
+    const frontmatter = fmMatch[1];
+
+    const blankCount = (frontmatter.match(/chat_url:\s*""/g) || []).length;
+    if (blankCount === 0) continue;
+
+    needsUrls.push({
+      path: notePath,
+      count: blankCount,
+      multiChat: frontmatter.includes('same_as_creator: false')
+    });
+  }
+
+  if (needsUrls.length === 0) {
+    return { content: [{ type: "text", text: "✅ All notes from today have chat URLs filled in." }] };
+  }
+
+  const lines: string[] = [`${needsUrls.length} note${needsUrls.length > 1 ? 's' : ''} from today need chat URLs:\n`];
+  for (const { path, count, multiChat } of needsUrls) {
+    const name = path.split('/').pop() || path;
+    const label = multiChat
+      ? `${count} URLs needed (created by one chat, edited by another)`
+      : `${count} URL needed (created and edited by same chat)`;
+    lines.push(`• ${name}\n  → ${label}\n`);
+  }
+  lines.push("Pull up today's chats in your sidebar and share the URLs when ready.");
+
+  return { content: [{ type: "text", text: lines.join('\n') }] };
 })
 
 app.all('*', async (c) => {
