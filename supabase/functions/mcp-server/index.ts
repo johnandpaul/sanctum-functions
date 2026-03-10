@@ -891,6 +891,198 @@ server.registerTool('move_folder', {
   }
 })
 
+server.registerTool('vault_health_check', {
+  title: 'Vault Health Check',
+  description: "Scan John's entire Obsidian vault and return a structured health report identifying: missing project frontmatter, duplicate Related sections, phantom folders (folder names that look like dated note titles), notes filed in wrong project folders, and sparse notes with minimal content.",
+  inputSchema: {}
+}, async () => {
+  async function getAllVaultNotes(folderPath = ''): Promise<string[]> {
+    const urlPath = folderPath ? `${folderPath}/` : ''
+    const res = await fetch(`${OBSIDIAN_API_URL}/vault/${urlPath}`, {
+      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+    })
+    if (!res.ok) return []
+    const data = await res.json()
+    const entries: string[] = data.files ?? []
+    const allNotes: string[] = []
+    for (const entry of entries) {
+      if (entry.endsWith('/')) {
+        const subfolderName = entry.slice(0, -1)
+        const subfolderPath = folderPath ? `${folderPath}/${subfolderName}` : subfolderName
+        const subNotes = await getAllVaultNotes(subfolderPath)
+        allNotes.push(...subNotes)
+      } else if (entry.endsWith('.md')) {
+        allNotes.push(folderPath ? `${folderPath}/${entry}` : entry)
+      }
+    }
+    return allNotes
+  }
+
+  const allNotes = await getAllVaultNotes()
+
+  const missingProject: string[] = []
+  const duplicateRelated: { path: string, count: number }[] = []
+  const phantomFolders = new Set<string>()
+  const wrongFolder: { path: string, project: string, expected: string }[] = []
+  const sparseNotes: string[] = []
+
+  const projectFolderMap: Record<string, string> = {
+    'sono': '01-projects/sono',
+    'dallas-tub-fix': '01-projects/dallas-tub-fix',
+    'sigyls': '01-projects/sigyls',
+    'sanctum': '01-projects/sanctum',
+    'turnkey': '01-projects/turnkey',
+    'personal': '02-areas/personal',
+    'finance': '02-areas/finance',
+    'family': '02-areas/family',
+  }
+
+  for (const notePath of allNotes) {
+    const res = await fetch(`${OBSIDIAN_API_URL}/vault/${notePath}`, {
+      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+    })
+    if (!res.ok) continue
+    const content = await res.text()
+
+    // a. Missing/empty project frontmatter
+    const projectMatch = content.match(/^project:\s*(.*)$/m)
+    if (!projectMatch || !projectMatch[1].trim()) {
+      missingProject.push(notePath)
+    }
+
+    // b. Duplicate Related sections
+    const relatedCount = (content.match(/^## Related/gm) || []).length
+    if (relatedCount > 1) {
+      duplicateRelated.push({ path: notePath, count: relatedCount })
+    }
+
+    // c. Phantom folders — any folder segment looks like a dated note title
+    const folder = notePath.includes('/') ? notePath.substring(0, notePath.lastIndexOf('/')) : ''
+    if (folder) {
+      for (const seg of folder.split('/')) {
+        if (/\d{4}-/.test(seg)) {
+          phantomFolders.add(folder)
+          break
+        }
+      }
+    }
+
+    // d. Notes in wrong folders
+    const projMatch = content.match(/^project:\s*(.+)$/m)
+    if (projMatch) {
+      const proj = projMatch[1].trim()
+      const expectedFolder = projectFolderMap[proj]
+      if (expectedFolder && !notePath.startsWith(expectedFolder)) {
+        wrongFolder.push({ path: notePath, project: proj, expected: expectedFolder })
+      }
+    }
+
+    // e. Sparse notes — body after frontmatter is less than 100 chars
+    const parts = content.split(/^---\s*$/m)
+    const body = parts.length >= 3 ? parts.slice(2).join('---').trim() : content.trim()
+    if (body.length < 100) {
+      sparseNotes.push(notePath)
+    }
+  }
+
+  const sections: string[] = [`🔍 Vault Health Report — ${allNotes.length} notes scanned`]
+
+  sections.push(`\n## Missing/Empty Project Frontmatter (${missingProject.length})`)
+  sections.push(missingProject.length ? missingProject.map(p => `  - ${p}`).join('\n') : '  ✅ None')
+
+  sections.push(`\n## Duplicate Related Sections (${duplicateRelated.length})`)
+  sections.push(duplicateRelated.length ? duplicateRelated.map(d => `  - ${d.path} (${d.count} sections)`).join('\n') : '  ✅ None')
+
+  sections.push(`\n## Phantom Folders (${phantomFolders.size})`)
+  sections.push(phantomFolders.size ? [...phantomFolders].map(f => `  - ${f}`).join('\n') : '  ✅ None')
+
+  sections.push(`\n## Notes in Wrong Folders (${wrongFolder.length})`)
+  sections.push(wrongFolder.length ? wrongFolder.map(w => `  - ${w.path} (project: ${w.project} → expected ${w.expected}/)`).join('\n') : '  ✅ None')
+
+  sections.push(`\n## Sparse Notes <100 chars (${sparseNotes.length})`)
+  sections.push(sparseNotes.length ? sparseNotes.map(p => `  - ${p}`).join('\n') : '  ✅ None')
+
+  return { content: [{ type: "text", text: sections.join('\n') }] }
+})
+
+server.registerTool('get_project_brief', {
+  title: 'Get Project Brief',
+  description: "Read a project's status note and return a structured briefing with current state, decisions, and next steps.",
+  inputSchema: {
+    project: z.string().describe("Project name: sigyls, dallas-tub-fix, sanctum, sono, turnkey, or other project folder name")
+  }
+}, async ({ project }) => {
+  const folderPath = `01-projects/${project}`
+  const listRes = await fetch(`${OBSIDIAN_API_URL}/vault/${folderPath}/`, {
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  })
+  if (!listRes.ok) {
+    return { content: [{ type: "text", text: `❌ Project folder not found: ${folderPath}` }] }
+  }
+  const data = await listRes.json()
+  const statusFile = (data.files || [])
+    .filter((f: string) => f.toLowerCase().includes('status') && f.endsWith('.md'))
+    .sort()
+    .reverse()[0]
+  if (!statusFile) {
+    return { content: [{ type: "text", text: `ℹ️ No status note found for project: ${project}` }] }
+  }
+  const notePath = `${folderPath}/${statusFile}`
+  const noteRes = await fetch(`${OBSIDIAN_API_URL}/vault/${notePath}`, {
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  })
+  if (!noteRes.ok) {
+    return { content: [{ type: "text", text: `❌ Could not read status note: ${notePath}` }] }
+  }
+  const content = await noteRes.text()
+  const dateMatch = content.match(/^(?:updated|created|date):\s*(.+)$/m)
+  const lastModified = dateMatch ? dateMatch[1].trim() : 'unknown'
+  return {
+    content: [{ type: "text", text: `# Project Brief: ${project}\n📄 ${notePath}\n🕐 Last modified: ${lastModified}\n\n${content}` }]
+  }
+})
+
+server.registerTool('update_project_status', {
+  title: 'Update Project Status',
+  description: "Write or rewrite a project's status note. Use at the end of a work session to record current state, decisions, and next steps. Replaces any existing status file (including dated variants) with a clean status.md.",
+  inputSchema: {
+    project: z.string().describe("Project name: sigyls, dallas-tub-fix, sanctum, sono, turnkey"),
+    content: z.string().describe("Full content of the status note to write")
+  }
+}, async ({ project, content }) => {
+  const folderPath = `01-projects/${project}`
+  const targetPath = `${folderPath}/status.md`
+
+  // Find and delete any existing status file at a different path
+  const listRes = await fetch(`${OBSIDIAN_API_URL}/vault/${folderPath}/`, {
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  })
+  if (listRes.ok) {
+    const data = await listRes.json()
+    const existingStatus = (data.files || [])
+      .filter((f: string) => f.toLowerCase().includes('status') && f.endsWith('.md'))
+      .sort()
+      .reverse()[0]
+    if (existingStatus && existingStatus !== 'status.md') {
+      await fetch(`${OBSIDIAN_API_URL}/vault/${folderPath}/${existingStatus}`, {
+        method: "DELETE",
+        headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+      })
+    }
+  }
+
+  const writeRes = await fetch(`${OBSIDIAN_API_URL}/vault/${targetPath}`, {
+    method: "PUT",
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}`, "Content-Type": "text/markdown" },
+    body: content,
+  })
+  return {
+    content: [{ type: "text", text: writeRes.ok
+      ? `✅ Status updated: ${targetPath}`
+      : `❌ Failed to write status note for project: ${project}` }]
+  }
+})
+
 app.all('*', async (c) => {
   const transport = new WebStandardStreamableHTTPServerTransport()
   await server.connect(transport)
