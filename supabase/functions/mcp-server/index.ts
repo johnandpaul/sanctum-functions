@@ -955,6 +955,416 @@ server.registerTool('update_project_status', {
   }
 })
 
+// ─── Task system helpers ───────────────────────────────────────────────────
+
+function extractSection(content: string, header: string): { lines: string[], startIdx: number, endIdx: number } {
+  const lines = content.split('\n')
+  const startIdx = lines.findIndex(l => l.trim() === `## ${header}`)
+  if (startIdx === -1) return { lines: [], startIdx: -1, endIdx: -1 }
+  let endIdx = lines.length
+  for (let i = startIdx + 1; i < lines.length; i++) {
+    if (lines[i].startsWith('## ')) { endIdx = i; break }
+  }
+  return { lines: lines.slice(startIdx + 1, endIdx), startIdx, endIdx }
+}
+
+function insertIntoSection(content: string, header: string, newLine: string): string {
+  const allLines = content.split('\n')
+  const { startIdx, endIdx } = extractSection(content, header)
+  if (startIdx === -1) return content.trimEnd() + `\n\n## ${header}\n${newLine}\n`
+  allLines.splice(endIdx, 0, newLine)
+  return allLines.join('\n')
+}
+
+// ─── Task system tools ─────────────────────────────────────────────────────
+
+server.registerTool('generate_daily_note', {
+  title: 'Generate Daily Note',
+  description: "Assemble today's task list from the staging backlog, TCA duties, and personal items. If no backlog items are selected, returns the staging backlog for John to choose from before generating the note.",
+  inputSchema: {
+    selected_backlog: z.array(z.string()).optional().describe("Specific staging backlog items to include today. If omitted, returns the backlog for selection.")
+  }
+}, async ({ selected_backlog }) => {
+  const [stagingRes, tcaRes, personalRes] = await Promise.all([
+    fetch(`${OBSIDIAN_API_URL}/vault/02-areas/tasks/staging.md`, { headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` } }),
+    fetch(`${OBSIDIAN_API_URL}/vault/02-areas/tasks/tca-duties.md`, { headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` } }),
+    fetch(`${OBSIDIAN_API_URL}/vault/02-areas/tasks/personal.md`, { headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` } }),
+  ])
+  if (!stagingRes.ok) return { content: [{ type: "text", text: "❌ Could not read 02-areas/tasks/staging.md" }] }
+  if (!tcaRes.ok) return { content: [{ type: "text", text: "❌ Could not read 02-areas/tasks/tca-duties.md" }] }
+  if (!personalRes.ok) return { content: [{ type: "text", text: "❌ Could not read 02-areas/tasks/personal.md" }] }
+
+  const [stagingContent, tcaContent, personalContent] = await Promise.all([
+    stagingRes.text(), tcaRes.text(), personalRes.text()
+  ])
+
+  // Early return: no items selected — return backlog for John to pick from
+  if (!selected_backlog || selected_backlog.length === 0) {
+    const { lines } = extractSection(stagingContent, 'Backlog')
+    const backlogItems = lines.filter(l => l.trim().startsWith('- '))
+    return {
+      content: [{
+        type: "text",
+        text: `📋 Staging Backlog — which items do you want in today's note?\n\n${backlogItems.join('\n') || '(empty)'}\n\nCall generate_daily_note again with selected_backlog listing the items to include.`
+      }]
+    }
+  }
+
+  const today = new Date().toISOString().split('T')[0]
+  const dayOfWeek = new Date().getDay() // 0=Sun, 1=Mon
+  const dayOfMonth = new Date().getDate()
+
+  // Staging section — strip any existing checkbox prefix before re-adding
+  const stagingLines = selected_backlog.map(item => `- [ ] ${item.replace(/^- \[[ x]\] /i, '')}`)
+
+  // TCA duties: always daily, weekly on Monday, monthly on 1st
+  const tcaDailyLines = extractSection(tcaContent, 'Daily').lines.filter(l => l.trim().startsWith('- '))
+  const tcaWeeklyLines = dayOfWeek === 1 ? extractSection(tcaContent, 'Weekly').lines.filter(l => l.trim().startsWith('- ')) : []
+  const tcaMonthlyLines = dayOfMonth === 1 ? extractSection(tcaContent, 'Monthly').lines.filter(l => l.trim().startsWith('- ')) : []
+  const tcaLines = [...tcaDailyLines, ...tcaWeeklyLines, ...tcaMonthlyLines]
+
+  // Personal upcoming items — skip placeholder lines
+  const personalLines = extractSection(personalContent, 'Upcoming').lines
+    .filter(l => l.trim() && l.trim() !== '(empty)')
+
+  const note = `---
+type: daily-tasks
+status: active
+tags: [tasks/daily]
+created: ${today}
+project: sanctum
+---
+
+# Daily Tasks — ${today}
+
+## From Staging Backlog
+${stagingLines.length ? stagingLines.join('\n') : '(none selected)'}
+
+## TCA Duties
+${tcaLines.length ? tcaLines.join('\n') : '(none for today)'}
+
+## Personal
+${personalLines.length ? personalLines.join('\n') : '(none)'}
+
+## Notes
+`
+
+  const fileName = `00-inbox/${today}-daily-tasks.md`
+  const writeRes = await fetch(`${OBSIDIAN_API_URL}/vault/${fileName}`, {
+    method: "PUT",
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}`, "Content-Type": "text/markdown" },
+    body: note,
+  })
+
+  return {
+    content: [{
+      type: "text",
+      text: writeRes.ok
+        ? `✅ Daily note created: ${fileName}\n\n${note}`
+        : `❌ Failed to save daily note`
+    }]
+  }
+})
+
+server.registerTool('archive_task_note', {
+  title: 'Archive Task Note',
+  description: "Archive a daily task note to 04-archive/tasks/. Checks for unchecked items first and returns them for resolution before archiving.",
+  inputSchema: {
+    date: z.string().optional().describe("Date of the daily note to archive (YYYY-MM-DD). Defaults to today.")
+  }
+}, async ({ date }) => {
+  const targetDate = date || new Date().toISOString().split('T')[0]
+
+  const candidates = [
+    `00-inbox/${targetDate}-daily-tasks.md`,
+    `01-projects/sanctum/${targetDate}-daily-tasks.md`,
+  ]
+
+  let sourcePath = ''
+  let noteContent = ''
+  for (const p of candidates) {
+    const res = await fetch(`${OBSIDIAN_API_URL}/vault/${p}`, { headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` } })
+    if (res.ok) { sourcePath = p; noteContent = await res.text(); break }
+  }
+
+  if (!sourcePath) {
+    return { content: [{ type: "text", text: `❌ Daily note not found for ${targetDate}\nChecked:\n  - ${candidates.join('\n  - ')}` }] }
+  }
+
+  const unchecked = noteContent.split('\n').filter(l => /^- \[ \]/.test(l.trim()))
+  if (unchecked.length > 0) {
+    return {
+      content: [{
+        type: "text",
+        text: `⚠️ ${unchecked.length} unchecked item${unchecked.length !== 1 ? 's' : ''} in ${sourcePath}:\n\n${unchecked.join('\n')}\n\nResolve these first, then call archive_task_note again.`
+      }]
+    }
+  }
+
+  const updated = noteContent.replace(/^(status:\s*)(.+)$/m, '$1archived')
+  const archivePath = `04-archive/tasks/${targetDate}-daily-tasks.md`
+
+  const writeRes = await fetch(`${OBSIDIAN_API_URL}/vault/${archivePath}`, {
+    method: "PUT",
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}`, "Content-Type": "text/markdown" },
+    body: updated,
+  })
+  if (!writeRes.ok) return { content: [{ type: "text", text: `❌ Failed to write archive: ${archivePath}` }] }
+
+  const deleteRes = await fetch(`${OBSIDIAN_API_URL}/vault/${sourcePath}`, {
+    method: "DELETE",
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  })
+
+  const completed = (noteContent.match(/^- \[x\]/gim) || []).length
+
+  return {
+    content: [{
+      type: "text",
+      text: deleteRes.ok
+        ? `✅ Archived: ${sourcePath} → ${archivePath}\n  ${completed} completed task${completed !== 1 ? 's' : ''} preserved`
+        : `⚠️ Copied to ${archivePath} but failed to delete original: ${sourcePath}`
+    }]
+  }
+})
+
+server.registerTool('get_tasks', {
+  title: 'Get Tasks',
+  description: "Return tasks filtered by scope: today's tasks, this week, this month, or all task files.",
+  inputSchema: {
+    scope: z.string().describe("Scope: 'today', 'week', 'month', or 'all'")
+  }
+}, async ({ scope }) => {
+  const today = new Date().toISOString().split('T')[0]
+
+  const stagingRes = await fetch(`${OBSIDIAN_API_URL}/vault/02-areas/tasks/staging.md`, {
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  })
+  const stagingContent = stagingRes.ok ? await stagingRes.text() : ''
+  const stagingBacklog = stagingRes.ok
+    ? extractSection(stagingContent, 'Backlog').lines.filter(l => l.trim().startsWith('- ')).join('\n') || '(empty)'
+    : '(unavailable)'
+
+  if (scope === 'today') {
+    const dailyRes = await fetch(`${OBSIDIAN_API_URL}/vault/00-inbox/${today}-daily-tasks.md`, {
+      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+    })
+    const dailyContent = dailyRes.ok ? await dailyRes.text() : null
+    return {
+      content: [{
+        type: "text",
+        text: `## Staging Backlog\n${stagingBacklog}\n\n## Today's Daily Note (${today})\n${dailyContent || '(no daily note yet — run generate_daily_note)'}`
+      }]
+    }
+  }
+
+  if (scope === 'week' || scope === 'month') {
+    const now = new Date()
+    let rangeStart: Date
+    if (scope === 'week') {
+      rangeStart = new Date(now)
+      const day = rangeStart.getDay()
+      rangeStart.setDate(rangeStart.getDate() - (day === 0 ? 6 : day - 1))
+    } else {
+      rangeStart = new Date(now.getFullYear(), now.getMonth(), 1)
+    }
+
+    const [inboxRes, archiveRes] = await Promise.all([
+      fetch(`${OBSIDIAN_API_URL}/vault/00-inbox/`, { headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` } }),
+      fetch(`${OBSIDIAN_API_URL}/vault/04-archive/tasks/`, { headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` } }),
+    ])
+    const inboxFiles: string[] = inboxRes.ok ? ((await inboxRes.json()).files || []) : []
+    const archiveFiles: string[] = archiveRes.ok ? ((await archiveRes.json()).files || []) : []
+
+    const candidates = [
+      ...inboxFiles.map(f => ({ file: f, folder: '00-inbox' })),
+      ...archiveFiles.map(f => ({ file: f, folder: '04-archive/tasks' })),
+    ]
+
+    const dailyNotePaths = candidates
+      .filter(({ file }) => /^\d{4}-\d{2}-\d{2}-daily-tasks\.md$/.test(file))
+      .filter(({ file }) => {
+        const fileDate = new Date(file.slice(0, 10))
+        return fileDate >= rangeStart && fileDate <= now
+      })
+      .map(({ file, folder }) => ({ path: `${folder}/${file}`, date: file.slice(0, 10) }))
+      .sort((a, b) => a.date.localeCompare(b.date))
+
+    const summaryLines: string[] = []
+    for (const { path, date } of dailyNotePaths) {
+      const res = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, { headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` } })
+      if (!res.ok) continue
+      const content = await res.text()
+      const completed = (content.match(/^- \[x\]/gim) || []).length
+      const pending = (content.match(/^- \[ \]/gm) || []).length
+      summaryLines.push(`  ${date}: ${completed} done, ${pending} pending`)
+    }
+
+    return {
+      content: [{
+        type: "text",
+        text: `## Staging Backlog\n${stagingBacklog}\n\n## ${scope === 'week' ? 'This Week' : 'This Month'} (${dailyNotePaths.length} daily note${dailyNotePaths.length !== 1 ? 's' : ''})\n${summaryLines.join('\n') || '  (none found)'}`
+      }]
+    }
+  }
+
+  if (scope === 'all') {
+    const [tcaRes, personalRes, dailyRes] = await Promise.all([
+      fetch(`${OBSIDIAN_API_URL}/vault/02-areas/tasks/tca-duties.md`, { headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` } }),
+      fetch(`${OBSIDIAN_API_URL}/vault/02-areas/tasks/personal.md`, { headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` } }),
+      fetch(`${OBSIDIAN_API_URL}/vault/00-inbox/${today}-daily-tasks.md`, { headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` } }),
+    ])
+    const tcaContent = tcaRes.ok ? await tcaRes.text() : '(unavailable)'
+    const personalContent = personalRes.ok ? await personalRes.text() : '(unavailable)'
+    const dailyContent = dailyRes.ok ? await dailyRes.text() : '(no daily note today)'
+
+    return {
+      content: [{
+        type: "text",
+        text: `## Staging Backlog\n${stagingBacklog}\n\n## TCA Duties\n${tcaContent}\n\n## Personal\n${personalContent}\n\n## Today's Daily Note (${today})\n${dailyContent}`
+      }]
+    }
+  }
+
+  return { content: [{ type: "text", text: `❌ Unknown scope: "${scope}". Use 'today', 'week', 'month', or 'all'.` }] }
+})
+
+server.registerTool('add_task', {
+  title: 'Add Task',
+  description: "Add a new task to the staging backlog, personal list, today's daily note, or TCA duties.",
+  inputSchema: {
+    task: z.string().describe("The task text to add"),
+    destination: z.string().describe("Where to add it: 'staging', 'personal', 'daily', 'tca-daily', 'tca-weekly', 'tca-monthly'")
+  }
+}, async ({ task, destination }) => {
+  const today = new Date().toISOString().split('T')[0]
+  const destinationMap: Record<string, { file: string, section: string }> = {
+    'staging':     { file: '02-areas/tasks/staging.md',   section: 'Backlog' },
+    'personal':    { file: '02-areas/tasks/personal.md',  section: 'Upcoming' },
+    'daily':       { file: `00-inbox/${today}-daily-tasks.md`, section: 'Notes' },
+    'tca-daily':   { file: '02-areas/tasks/tca-duties.md', section: 'Daily' },
+    'tca-weekly':  { file: '02-areas/tasks/tca-duties.md', section: 'Weekly' },
+    'tca-monthly': { file: '02-areas/tasks/tca-duties.md', section: 'Monthly' },
+  }
+
+  const target = destinationMap[destination]
+  if (!target) {
+    return { content: [{ type: "text", text: `❌ Unknown destination: "${destination}". Use: staging, personal, daily, tca-daily, tca-weekly, tca-monthly` }] }
+  }
+
+  const readRes = await fetch(`${OBSIDIAN_API_URL}/vault/${target.file}`, {
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  })
+  if (!readRes.ok) {
+    const hint = destination === 'daily' ? ' — run generate_daily_note first' : ''
+    return { content: [{ type: "text", text: `❌ File not found: ${target.file}${hint}` }] }
+  }
+  const content = await readRes.text()
+  const updated = insertIntoSection(content, target.section, `- [ ] ${task}`)
+
+  const writeRes = await fetch(`${OBSIDIAN_API_URL}/vault/${target.file}`, {
+    method: "PUT",
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}`, "Content-Type": "text/markdown" },
+    body: updated,
+  })
+
+  return {
+    content: [{ type: "text", text: writeRes.ok
+      ? `✅ Added to ${destination}: ${task}`
+      : `❌ Failed to write to ${target.file}` }]
+  }
+})
+
+server.registerTool('complete_task', {
+  title: 'Complete Task',
+  description: "Mark a task as done in a vault note by replacing '- [ ]' with '- [x]' on the matching line.",
+  inputSchema: {
+    path: z.string().describe("Full path to the note, e.g. '00-inbox/2026-03-09-daily-tasks.md'"),
+    task_text: z.string().describe("Text of the task to mark complete (partial match, case-insensitive)")
+  }
+}, async ({ path, task_text }) => {
+  const readRes = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  })
+  if (!readRes.ok) return { content: [{ type: "text", text: `❌ Note not found: ${path}` }] }
+  const content = await readRes.text()
+
+  const lines = content.split('\n')
+  const lowerTask = task_text.toLowerCase()
+  const matchIdx = lines.findIndex(l => l.includes('- [ ]') && l.toLowerCase().includes(lowerTask))
+  if (matchIdx === -1) {
+    return { content: [{ type: "text", text: `❌ Unchecked task not found matching: "${task_text}" in ${path}` }] }
+  }
+
+  const matchedLine = lines[matchIdx]
+  lines[matchIdx] = matchedLine.replace('- [ ]', '- [x]')
+
+  const writeRes = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+    method: "PUT",
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}`, "Content-Type": "text/markdown" },
+    body: lines.join('\n'),
+  })
+
+  return {
+    content: [{ type: "text", text: writeRes.ok
+      ? `✅ Completed: ${matchedLine.trim()}`
+      : `❌ Failed to write to ${path}` }]
+  }
+})
+
+server.registerTool('update_staging', {
+  title: 'Update Staging',
+  description: "Manage the staging backlog directly: list current items, add a new item, or remove an existing one.",
+  inputSchema: {
+    action: z.string().describe("Action: 'list', 'add', or 'remove'"),
+    task: z.string().optional().describe("Task text — required for add/remove")
+  }
+}, async ({ action, task }) => {
+  const filePath = '02-areas/tasks/staging.md'
+  const readRes = await fetch(`${OBSIDIAN_API_URL}/vault/${filePath}`, {
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  })
+  if (!readRes.ok) return { content: [{ type: "text", text: `❌ Could not read ${filePath}` }] }
+  const content = await readRes.text()
+
+  if (action === 'list') {
+    const { lines } = extractSection(content, 'Backlog')
+    return { content: [{ type: "text", text: `## Backlog\n${lines.join('\n') || '(empty)'}` }] }
+  }
+
+  if (!task) {
+    return { content: [{ type: "text", text: `❌ 'task' parameter is required for action: ${action}` }] }
+  }
+
+  let updated: string
+  if (action === 'add') {
+    updated = insertIntoSection(content, 'Backlog', `- [ ] ${task}`)
+  } else if (action === 'remove') {
+    const { startIdx, endIdx } = extractSection(content, 'Backlog')
+    if (startIdx === -1) return { content: [{ type: "text", text: `❌ ## Backlog section not found in ${filePath}` }] }
+    const lines = content.split('\n')
+    const lowerTask = task.toLowerCase()
+    const matchIdx = lines.findIndex((l, i) => i > startIdx && i < endIdx && l.toLowerCase().includes(lowerTask))
+    if (matchIdx === -1) return { content: [{ type: "text", text: `❌ Task not found in backlog: "${task}"` }] }
+    lines.splice(matchIdx, 1)
+    updated = lines.join('\n')
+  } else {
+    return { content: [{ type: "text", text: `❌ Unknown action: "${action}". Use 'list', 'add', or 'remove'.` }] }
+  }
+
+  const writeRes = await fetch(`${OBSIDIAN_API_URL}/vault/${filePath}`, {
+    method: "PUT",
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}`, "Content-Type": "text/markdown" },
+    body: updated,
+  })
+  if (!writeRes.ok) return { content: [{ type: "text", text: `❌ Failed to write ${filePath}` }] }
+
+  const { lines: newLines } = extractSection(updated, 'Backlog')
+  return {
+    content: [{ type: "text", text: `✅ ${action === 'add' ? 'Added' : 'Removed'}: ${task}\n\n## Backlog\n${newLines.join('\n') || '(empty)'}` }]
+  }
+})
+
 app.all('*', async (c) => {
   const transport = new WebStandardStreamableHTTPServerTransport()
   await server.connect(transport)
