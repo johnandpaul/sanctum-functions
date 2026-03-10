@@ -25,7 +25,7 @@ async function writeNoteContent(path: string, content: string): Promise<boolean>
 
 async function findNotePath(filename: string): Promise<string | null> {
   // Search common folders for the note
-  const folders = ['00-inbox/', '01-projects/sigyls/', '01-projects/dallas-tub-fix/', '01-projects/sanctum/', '02-areas/', '03-resources/'];
+  const folders = ['00-inbox/', '01-projects/sigyls/', '01-projects/dallas-tub-fix/', '01-projects/sanctum/', '01-projects/sono/', '01-projects/turnkey/', '02-areas/', '03-resources/'];
   for (const folder of folders) {
     const response = await fetch(`${OBSIDIAN_API_URL}/vault/${folder}`, {
       headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
@@ -58,18 +58,6 @@ Deno.serve(async (req) => {
     if (!gapContent) {
       return new Response(JSON.stringify({ error: 'Could not read gap analysis note' }), {
         status: 500,
-        headers: { "Content-Type": "application/json" }
-      });
-    }
-
-    // Check status is approved
-    const statusMatch = gapContent.match(/^status:\s*(.+)$/m);
-    const status = statusMatch ? statusMatch[1].trim() : '';
-    if (status !== 'approved') {
-      return new Response(JSON.stringify({ 
-        error: `Gap analysis status is "${status}" — change to "approved" in frontmatter first` 
-      }), {
-        status: 400,
         headers: { "Content-Type": "application/json" }
       });
     }
@@ -110,8 +98,15 @@ Deno.serve(async (req) => {
         continue;
       }
 
-      // Add wikilink at end of note
-      const updatedContent = content.trimEnd() + `\n\n## Related\n[[${conn.to}]]\n`;
+      // Add wikilink, appending to existing ## Related section or creating one
+      const relatedIndex = content.lastIndexOf('## Related');
+      let updatedContent: string;
+      if (relatedIndex !== -1) {
+        const insertPos = content.indexOf('\n', relatedIndex) + 1;
+        updatedContent = content.slice(0, insertPos) + `[[${conn.to}]]\n` + content.slice(insertPos);
+      } else {
+        updatedContent = content.trimEnd() + `\n\n## Related\n[[${conn.to}]]\n`;
+      }
       const written = await writeNoteContent(fromPath, updatedContent);
       
       if (written) {
