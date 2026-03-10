@@ -147,9 +147,8 @@ ${analysis.orphaned_notes.map((n: string) => `- [[${n}]]`).join('\n') || '- None
 ${analysis.missing_concepts.map((c: string) => `- ${c}`).join('\n') || '- None identified'}
 
 ## Instructions
-Review each proposed connection above. To approve, change status to \`approved\` in frontmatter.
-To reject individual connections, delete them from the list above.
-When done reviewing, say "apply approved gap connections" in Claude.
+Review each proposed connection above. Delete any connections you don't want applied.
+When ready, click "Approve & Apply" in the email notification.
 `;
 
     const writeResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${fileName}`, {
@@ -186,9 +185,10 @@ When done reviewing, say "apply approved gap connections" in Claude.
   <li><strong>Connections proposed:</strong> ${analysis.proposed_connections.length}</li>
   <li><strong>Orphaned notes:</strong> ${analysis.orphaned_notes.length}</li>
 </ul>
-<p>Open Obsidian and check your inbox for <strong>${today}-gap-analysis.md</strong> to review and approve connections.</p>
-<p>When ready, tap below to apply all approved connections:</p>
-<p><a href="https://ozezxrmaoukpqjshimys.supabase.co/functions/v1/apply-gap-connections" style="background:#6366f1;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600;">Apply Gap Connections</a></p>`
+<p>Review the analysis in Obsidian, then delete any connections you don't want applied.</p>
+<p><a href="obsidian://open?vault=Vault&file=00-inbox/${today}-gap-analysis" style="background:#0f172a;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600;display:inline-block;margin-bottom:12px;">📓 Open in Obsidian</a></p>
+<p>When ready, click below to apply all remaining connections:</p>
+<p><a href="https://ozezxrmaoukpqjshimys.supabase.co/functions/v1/apply-gap-connections" style="background:#6366f1;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600;display:inline-block;">✅ Approve & Apply</a></p>`
       })
     });
 
