@@ -89,20 +89,6 @@ server.registerTool('search_vault', {
   };
 })
 
-server.registerTool('get_inbox', {
-  title: 'Get Inbox',
-  description: "Get recent notes from John's vault inbox.",
-  inputSchema: { limit: z.number().optional().describe("Number of notes to return, default 5") }
-}, async ({ limit = 5 }) => {
-  const response = await fetch(`${OBSIDIAN_API_URL}/vault/00-inbox/`, {
-    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
-  });
-  if (!response.ok) return { content: [{ type: "text", text: "Inbox is empty" }] };
-  const data = await response.json();
-  const files = (data.files || []).slice(0, limit).join("\n");
-  return { content: [{ type: "text", text: files || "Inbox is empty" }] };
-})
-
 server.registerTool('browse_vault', {
   title: 'Browse Vault',
   description: "Browse John's Obsidian vault folder structure and file tree. Use to explore what notes and folders exist, navigate the PARA structure, or find notes before reading them.",
@@ -200,54 +186,6 @@ ${content}
   };
 })
 
-server.registerTool('file_note', {
-  title: 'File Note',
-  description: "Move a note from the inbox to the correct PARA folder based on its project. Use when saving a note that belongs to a specific project rather than dropping it in inbox.",
-  inputSchema: {
-    filename: z.string().describe("The filename without path, e.g. 2026-02-28-my-note.md"),
-    project: z.string().describe("Project name: sigyls, dallas-tub-fix, sanctum, or area name like personal/finance")
-  }
-}, async ({ filename, project }) => {
-  // Read the note from inbox
-  const readResponse = await fetch(`${OBSIDIAN_API_URL}/vault/00-inbox/${filename}`, {
-    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
-  });
-  if (!readResponse.ok) return { content: [{ type: "text", text: `❌ Note not found in inbox: ${filename}` }] };
-  const content = await readResponse.text();
-
-  // Determine destination folder
-  const folderMap: Record<string, string> = {
-    "sigyls": "01-projects/sigyls",
-    "dallas-tub-fix": "01-projects/dallas-tub-fix",
-    "sanctum": "01-projects/sanctum",
-    "personal": "02-areas/personal",
-    "finance": "02-areas/finance",
-    "family": "02-areas/family",
-  };
-  const folder = folderMap[project] || `02-areas/${project}`;
-
-  // Write to destination
-  const writeResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${folder}/${filename}`, {
-    method: "PUT",
-    headers: {
-      "Authorization": `Bearer ${OBSIDIAN_API_KEY}`,
-      "Content-Type": "text/markdown",
-    },
-    body: content,
-  });
-  if (!writeResponse.ok) return { content: [{ type: "text", text: `❌ Failed to write to ${folder}` }] };
-
-  // Delete from inbox
-  const deleteResponse = await fetch(`${OBSIDIAN_API_URL}/vault/00-inbox/${filename}`, {
-    method: "DELETE",
-    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
-  });
-
-  return {
-    content: [{ type: "text", text: deleteResponse.ok ? `✅ Filed to ${folder}/${filename}` : `⚠️ Copied to ${folder} but inbox copy remains` }]
-  };
-})
-
 server.registerTool('semantic_search', {
   title: 'Semantic Search',
   description: "Search John's Obsidian vault by meaning rather than keywords. Finds notes that are conceptually related to the query even if they don't contain the exact words.",
@@ -339,72 +277,6 @@ server.registerTool('edit_note', {
   return {
     content: [{ type: "text", text: writeResponse.ok ? `✅ Note updated: ${path}` : `❌ Failed to update note` }]
   };
-})
-
-server.registerTool('organize_inbox', {
-  title: 'Organize Inbox',
-  description: "Automatically file all notes in the vault inbox to their correct PARA folders based on their project frontmatter tags. Use when John says 'organize my inbox' or 'file my notes'.",
-  inputSchema: {}
-}, async () => {
-  // Get inbox contents
-  const listResponse = await fetch(`${OBSIDIAN_API_URL}/vault/00-inbox/`, {
-    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
-  });
-  if (!listResponse.ok) return { content: [{ type: "text", text: "❌ Could not read inbox" }] };
-  const data = await listResponse.json();
-  const files = (data.files || []).filter((f: string) => f.endsWith('.md'));
-
-  if (!files.length) return { content: [{ type: "text", text: "✅ Inbox is already empty" }] };
-
-  const results: string[] = [];
-  const folderMap: Record<string, string> = {
-    "sigyls": "01-projects/sigyls",
-    "dallas-tub-fix": "01-projects/dallas-tub-fix",
-    "sanctum": "01-projects/sanctum",
-    "sono": "01-projects/sono",
-    "turnkey": "01-projects/turnkey",
-    "personal": "02-areas/personal",
-    "finance": "02-areas/finance",
-    "family": "02-areas/family",
-  };
-
-  for (const filename of files) {
-    // Read note content
-    const readResponse = await fetch(`${OBSIDIAN_API_URL}/vault/00-inbox/${filename}`, {
-      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
-    });
-    if (!readResponse.ok) { results.push(`❌ Could not read: ${filename}`); continue; }
-    const content = await readResponse.text();
-
-    // Extract project from frontmatter
-    const projectMatch = content.match(/^project:\s*(.+)$/m);
-    const project = projectMatch ? projectMatch[1].trim() : "";
-
-    if (!project) { results.push(`⏭️ Skipped (no project): ${filename}`); continue; }
-
-    const folder = folderMap[project] || `02-areas/${project}`;
-
-    // Write to destination
-    const writeResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${folder}/${filename}`, {
-      method: "PUT",
-      headers: {
-        "Authorization": `Bearer ${OBSIDIAN_API_KEY}`,
-        "Content-Type": "text/markdown",
-      },
-      body: content,
-    });
-    if (!writeResponse.ok) { results.push(`❌ Failed to file: ${filename}`); continue; }
-
-    // Delete from inbox
-    await fetch(`${OBSIDIAN_API_URL}/vault/00-inbox/${filename}`, {
-      method: "DELETE",
-      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
-    });
-
-    results.push(`✅ ${filename} → ${folder}`);
-  }
-
-  return { content: [{ type: "text", text: results.join("\n") }] };
 })
 
 server.registerTool('vault_profile_sync', {
