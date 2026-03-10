@@ -746,6 +746,151 @@ server.registerTool('clean_note_structure', {
   };
 })
 
+server.registerTool('create_folder', {
+  title: 'Create Folder',
+  description: "Create a new folder in John's Obsidian vault by placing a .gitkeep.md placeholder file inside it (since folders are created implicitly by file creation).",
+  inputSchema: {
+    folder_path: z.string().describe("Full folder path to create, e.g. '01-projects/new-folder'")
+  }
+}, async ({ folder_path }) => {
+  const cleanPath = folder_path.replace(/\/+$/, '')
+  const placeholderPath = `${cleanPath}/.gitkeep.md`
+  const response = await fetch(`${OBSIDIAN_API_URL}/vault/${placeholderPath}`, {
+    method: "PUT",
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}`, "Content-Type": "text/markdown" },
+    body: "",
+  })
+  return {
+    content: [{ type: "text", text: response.ok
+      ? `✅ Created folder: ${cleanPath}`
+      : `❌ Failed to create folder: ${cleanPath}` }]
+  }
+})
+
+server.registerTool('delete_folder', {
+  title: 'Delete Folder',
+  description: "Delete a folder and its contents from John's Obsidian vault. Requires force=true if the folder is non-empty. Note: the empty folder itself may remain on disk since the API cannot delete folders directly.",
+  inputSchema: {
+    folder_path: z.string().describe("Full folder path to delete, e.g. '01-projects/old-folder'"),
+    force: z.boolean().default(false).describe("Set to true to delete even if the folder has contents")
+  }
+}, async ({ folder_path, force }) => {
+  const cleanPath = folder_path.replace(/\/+$/, '')
+  const listResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${cleanPath}/`, {
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  })
+  if (!listResponse.ok) {
+    return { content: [{ type: "text", text: `❌ Folder not found: ${cleanPath}` }] }
+  }
+  const listing = await listResponse.json()
+  const files: string[] = listing.files ?? []
+  if (files.length > 0 && !force) {
+    const fileList = files.map(f => `  - ${f}`).join('\n')
+    return {
+      content: [{ type: "text", text: `⚠️ Folder is non-empty (${files.length} file${files.length !== 1 ? 's' : ''}):\n${fileList}\n\nRe-run with force=true to delete all contents.` }]
+    }
+  }
+  const results: string[] = []
+  for (const file of files) {
+    const delResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${cleanPath}/${file}`, {
+      method: "DELETE",
+      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+    })
+    results.push(delResponse.ok ? `✅ Deleted: ${file}` : `❌ Failed to delete: ${file}`)
+  }
+  const summary = results.length > 0 ? results.join('\n') + '\n' : ''
+  return {
+    content: [{ type: "text", text: `${summary}🗑️ ${results.length} file${results.length !== 1 ? 's' : ''} deleted from ${cleanPath}\nNote: empty folder may remain on disk — the API cannot delete folders directly.` }]
+  }
+})
+
+server.registerTool('rename_folder', {
+  title: 'Rename Folder',
+  description: "Rename a folder in place in John's Obsidian vault by moving all its contents to a new folder name in the same parent directory.",
+  inputSchema: {
+    folder_path: z.string().describe("Full current folder path, e.g. '01-projects/old-name'"),
+    new_name: z.string().describe("New folder name only (no path), e.g. 'new-name'")
+  }
+}, async ({ folder_path, new_name }) => {
+  const cleanPath = folder_path.replace(/\/+$/, '')
+  const parent = cleanPath.substring(0, cleanPath.lastIndexOf('/'))
+  const newPath = parent ? `${parent}/${new_name}` : new_name
+  const listResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${cleanPath}/`, {
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  })
+  if (!listResponse.ok) {
+    return { content: [{ type: "text", text: `❌ Folder not found: ${cleanPath}` }] }
+  }
+  const listing = await listResponse.json()
+  const files: string[] = listing.files ?? []
+  const results: string[] = []
+  for (const file of files) {
+    const readResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${cleanPath}/${file}`, {
+      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+    })
+    if (!readResponse.ok) { results.push(`❌ Failed to read: ${file}`); continue }
+    const content = await readResponse.text()
+    const writeResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${newPath}/${file}`, {
+      method: "PUT",
+      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}`, "Content-Type": "text/markdown" },
+      body: content,
+    })
+    if (!writeResponse.ok) { results.push(`❌ Failed to write: ${file}`); continue }
+    const delResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${cleanPath}/${file}`, {
+      method: "DELETE",
+      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+    })
+    results.push(delResponse.ok ? `✅ ${file}` : `⚠️ Copied but failed to delete: ${file}`)
+  }
+  const summary = results.length > 0 ? '\n' + results.join('\n') : ' (empty folder)'
+  return {
+    content: [{ type: "text", text: `✅ Renamed: ${cleanPath} → ${newPath}\nMoved ${files.length} file${files.length !== 1 ? 's' : ''}${summary}` }]
+  }
+})
+
+server.registerTool('move_folder', {
+  title: 'Move Folder',
+  description: "Move a folder and all its contents to a new location in John's Obsidian vault.",
+  inputSchema: {
+    source_path: z.string().describe("Full source folder path, e.g. '01-projects/old-location/my-folder'"),
+    destination_path: z.string().describe("Full destination folder path, e.g. '02-areas/my-folder'")
+  }
+}, async ({ source_path, destination_path }) => {
+  const cleanSource = source_path.replace(/\/+$/, '')
+  const cleanDest = destination_path.replace(/\/+$/, '')
+  const listResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${cleanSource}/`, {
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  })
+  if (!listResponse.ok) {
+    return { content: [{ type: "text", text: `❌ Folder not found: ${cleanSource}` }] }
+  }
+  const listing = await listResponse.json()
+  const files: string[] = listing.files ?? []
+  const results: string[] = []
+  for (const file of files) {
+    const readResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${cleanSource}/${file}`, {
+      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+    })
+    if (!readResponse.ok) { results.push(`❌ Failed to read: ${file}`); continue }
+    const content = await readResponse.text()
+    const writeResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${cleanDest}/${file}`, {
+      method: "PUT",
+      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}`, "Content-Type": "text/markdown" },
+      body: content,
+    })
+    if (!writeResponse.ok) { results.push(`❌ Failed to write: ${file}`); continue }
+    const delResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${cleanSource}/${file}`, {
+      method: "DELETE",
+      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+    })
+    results.push(delResponse.ok ? `✅ ${file}` : `⚠️ Copied but failed to delete: ${file}`)
+  }
+  const summary = results.length > 0 ? '\n' + results.join('\n') : ' (empty folder)'
+  return {
+    content: [{ type: "text", text: `✅ Moved: ${cleanSource} → ${cleanDest}\nMoved ${files.length} file${files.length !== 1 ? 's' : ''}${summary}` }]
+  }
+})
+
 app.all('*', async (c) => {
   const transport = new WebStandardStreamableHTTPServerTransport()
   await server.connect(transport)
