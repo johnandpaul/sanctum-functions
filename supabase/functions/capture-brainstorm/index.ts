@@ -49,11 +49,10 @@ ${actions ? actions.map((a: string) => `- [ ] ${a}`).join("\n") : "- [ ] "}
 ${raw || ""}
 
 ## Related
-- 
 `;
 
   // Write to Obsidian via Local REST API
-  const fileName = `00-inbox/${today}-${title.toLowerCase().replace(/\s+/g, "-")}.md`;
+  const fileName = `00-inbox/${today}-${title.toLowerCase().replace(/\s+/g, "-").replace(/\//g, "-")}.md`;
 
   const obsidianResponse = await fetch(
     `${OBSIDIAN_API_URL}/vault/${fileName}`,

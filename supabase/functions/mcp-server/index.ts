@@ -50,9 +50,8 @@ ${actions ? actions.map(a => `- [ ] ${a}`).join("\n") : "- [ ] "}
 ${raw || ""}
 
 ## Related
-- 
 `;
-  const fileName = `00-inbox/${today}-${title.toLowerCase().replace(/\s+/g, "-")}.md`;
+  const fileName = `00-inbox/${today}-${title.toLowerCase().replace(/\s+/g, "-").replace(/\//g, "-")}.md`;
   const response = await fetch(`${OBSIDIAN_API_URL}/vault/${fileName}`, {
     method: "PUT",
     headers: {
@@ -404,6 +403,178 @@ server.registerTool('organize_inbox', {
   }
 
   return { content: [{ type: "text", text: results.join("\n") }] };
+})
+
+server.registerTool('vault_profile_sync', {
+  title: 'Vault Profile Sync',
+  description: "Reads John's vault across all active projects and synthesizes a structured profile capturing current project status, next steps, recent decisions, and business context. Writes the profile to 03-resources/claude-profile.md and returns it to Claude for Layer 2 memory update.",
+  inputSchema: {
+    confirm: z.string().optional().describe("Optional confirmation message, leave empty to run")
+  }
+}, async () => {
+  const notes: { path: string, content: string }[] = []
+  const projects = ['sono', 'dallas-tub-fix', 'sigyls', 'turnkey', 'sanctum']
+  const today = new Date()
+
+  // LAYER 1 — STATUS note from each project folder (matches STATUS.md or date-prefixed status files)
+  for (const project of projects) {
+    const listRes = await fetch(`${OBSIDIAN_API_URL}/vault/01-projects/${project}/`, {
+      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+    })
+    if (!listRes.ok) continue
+    const data = await listRes.json()
+    const statusFile = (data.files || [])
+      .filter((f: string) => f.toLowerCase().includes('status') && f.endsWith('.md'))
+      .sort()
+      .reverse()[0]
+    if (!statusFile) continue
+    const path = `01-projects/${project}/${statusFile}`
+    const res = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+    })
+    if (res.ok) {
+      const content = await res.text()
+      notes.push({ path, content })
+    }
+  }
+  // LAYER 2 — Handoff notes
+  for (const project of projects) {
+    const listRes = await fetch(`${OBSIDIAN_API_URL}/vault/01-projects/${project}/`, {
+      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+    })
+    if (!listRes.ok) continue
+    const data = await listRes.json()
+    const handoffFiles = (data.files || []).filter((f: string) => f.toLowerCase().includes('handoff'))
+    // Get the most recent handoff only
+    const latest = handoffFiles.sort().reverse()[0]
+    if (!latest) continue
+    const path = `01-projects/${project}/${latest}`
+    const noteRes = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+    })
+    if (noteRes.ok) {
+      const content = await noteRes.text()
+      notes.push({ path, content })
+    }
+  }
+  // LAYER 3 — Last 7 days
+  const sevenDaysAgo = new Date(today)
+  sevenDaysAgo.setDate(today.getDate() - 7)
+
+  for (const project of projects) {
+    const listRes = await fetch(`${OBSIDIAN_API_URL}/vault/01-projects/${project}/`, {
+      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+    })
+    if (!listRes.ok) continue
+    const data = await listRes.json()
+    const recentFiles = (data.files || []).filter((f: string) => {
+      const dateMatch = f.match(/^(\d{4}-\d{2}-\d{2})/)
+      if (!dateMatch) return false
+      const fileDate = new Date(dateMatch[1])
+      return fileDate >= sevenDaysAgo
+    })
+    for (const file of recentFiles) {
+      const path = `01-projects/${project}/${file}`
+      // Skip if already collected in Layer 1 or 2
+      if (notes.some(n => n.path === path)) continue
+      const noteRes = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+        headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+      })
+      if (noteRes.ok) {
+        const content = await noteRes.text()
+        notes.push({ path, content })
+      }
+    }
+  }
+  // LAYER 4 — Semantic search
+  const searchRes = await fetch('https://ozezxrmaoukpqjshimys.supabase.co/functions/v1/semantic-search', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SUPABASE_ANON_KEY}` },
+    body: JSON.stringify({ query: 'current priorities next steps active work recent decisions', limit: 5 })
+  })
+  if (searchRes.ok) {
+    const searchData = await searchRes.json()
+    for (const result of (searchData.results || [])) {
+      // Skip if already collected
+      if (notes.some(n => n.path === result.path)) continue
+      notes.push({ path: result.path, content: result.content })
+    }
+  }
+
+  // Synthesize profile with Gemini
+  const combinedNotes = notes.map(n => `--- ${n.path} ---\n${n.content}`).join('\n\n')
+
+  const geminiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${Deno.env.get('GEMINI_API_KEY')}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{
+        parts: [{
+          text: `You are synthesizing a profile of John's current work state from his vault notes.
+
+Based on the notes below, produce a structured profile with exactly these four sections:
+
+## Active Projects & Phase
+For each active project, one line: project name — current phase — status
+
+## Immediate Next Steps
+The most pressing action items across all projects, max 8 bullet points total
+
+## Recent Decisions
+Key decisions made recently that affect future work, max 6 bullet points
+
+## Business Context
+One line per active venture summarizing where it stands right now
+
+Be concise and specific. Use only what is actually in the notes — do not infer or invent.
+
+NOTES:
+${combinedNotes}`
+        }]
+      }]
+    })
+  })
+
+  if (!geminiRes.ok) {
+    return { content: [{ type: "text", text: `❌ Gemini synthesis failed: ${geminiRes.status}` }] }
+  }
+
+  const geminiData = await geminiRes.json()
+  const profile = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || ''
+
+  if (!profile) {
+    return { content: [{ type: "text", text: '❌ Gemini returned empty profile' }] }
+  }
+
+  // Write profile to vault
+  const profileNote = `---
+type: resource
+status: active
+tags: [sanctum/claude-profile]
+created: ${today.toISOString().split('T')[0]}
+source: vault-profile-sync
+---
+
+# Claude Profile — Last Synced ${today.toISOString().split('T')[0]}
+
+${profile}
+`
+
+  await fetch(`${OBSIDIAN_API_URL}/vault/03-resources/claude-profile.md`, {
+    method: 'PUT',
+    headers: {
+      'Authorization': `Bearer ${OBSIDIAN_API_KEY}`,
+      'Content-Type': 'text/markdown'
+    },
+    body: profileNote
+  })
+
+  return {
+    content: [{
+      type: "text",
+      text: `✅ Vault profile synced — ${notes.length} notes read\n\n${profile}`
+    }]
+  }
 })
 
 server.registerTool('run_gap_filler', {
