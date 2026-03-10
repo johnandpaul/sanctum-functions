@@ -361,6 +361,8 @@ server.registerTool('organize_inbox', {
     "sigyls": "01-projects/sigyls",
     "dallas-tub-fix": "01-projects/dallas-tub-fix",
     "sanctum": "01-projects/sanctum",
+    "sono": "01-projects/sono",
+    "turnkey": "01-projects/turnkey",
     "personal": "02-areas/personal",
     "finance": "02-areas/finance",
     "family": "02-areas/family",
