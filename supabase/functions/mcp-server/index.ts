@@ -826,8 +826,10 @@ server.registerTool('move_folder', {
 server.registerTool('vault_health_check', {
   title: 'Vault Health Check',
   description: "Scan John's entire Obsidian vault and return a structured health report identifying: missing project frontmatter, duplicate Related sections, phantom folders (folder names that look like dated note titles), notes filed in wrong project folders, and sparse notes with minimal content.",
-  inputSchema: {}
-}, async () => {
+  inputSchema: {
+    purge_stale_embeddings: z.boolean().optional().describe("When true, delete all stale embedding rows after detection. Default: false.")
+  }
+}, async ({ purge_stale_embeddings = false }) => {
   const allNotes = await getAllVaultNotes()
 
   const missingProject: string[] = []
@@ -927,6 +929,18 @@ server.registerTool('vault_health_check', {
 
   sections.push(`\n## Stale Embedding Paths (${staleEmbeddings.length})`)
   sections.push(staleEmbeddings.length ? staleEmbeddings.map(p => `  - ${p}`).join('\n') : '  ✅ None')
+
+  if (purge_stale_embeddings && staleEmbeddings.length > 0) {
+    const { error: purgeError } = await supabase
+      .from('note_embeddings')
+      .delete()
+      .in('path', staleEmbeddings)
+    if (purgeError) {
+      sections.push(`\n## Purge Result\n  ❌ Failed to delete stale embeddings: ${purgeError.message}`)
+    } else {
+      sections.push(`\n## Purge Result\n  ✅ Deleted ${staleEmbeddings.length} stale embedding row(s)`)
+    }
+  }
 
   return { content: [{ type: "text", text: sections.join('\n') }] }
 })
