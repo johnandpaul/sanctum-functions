@@ -3,10 +3,15 @@ import { McpServer } from 'npm:@modelcontextprotocol/sdk@1.25.3/server/mcp.js'
 import { WebStandardStreamableHTTPServerTransport } from 'npm:@modelcontextprotocol/sdk@1.25.3/server/webStandardStreamableHttp.js'
 import { Hono } from 'npm:hono@^4.9.7'
 import { z } from 'npm:zod@^4.1.13'
+import { createClient } from 'npm:@supabase/supabase-js@2'
 
 const OBSIDIAN_API_URL = Deno.env.get("OBSIDIAN_API_URL")!;
 const OBSIDIAN_API_KEY = Deno.env.get("OBSIDIAN_API_KEY")!;
 const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 const app = new Hono()
 const server = new McpServer({ name: 'sanctum-vault', version: '1.0.0' })
@@ -536,6 +541,14 @@ server.registerTool('move_note', {
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   });
 
+  const { error: embeddingError } = await supabase
+    .from('note_embeddings')
+    .update({ path: destination_path })
+    .eq('path', source_path);
+  if (embeddingError) {
+    console.warn(`⚠️ Embeddings path update failed for move ${source_path} → ${destination_path}:`, embeddingError.message);
+  }
+
   return {
     content: [{ type: "text", text: deleteResponse.ok
       ? `✅ Moved: ${source_path} → ${destination_path}`
@@ -571,6 +584,14 @@ server.registerTool('rename_note', {
     method: "DELETE",
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   });
+
+  const { error: embeddingError } = await supabase
+    .from('note_embeddings')
+    .update({ path: new_path })
+    .eq('path', path);
+  if (embeddingError) {
+    console.warn(`⚠️ Embeddings path update failed for rename ${path} → ${new_path}:`, embeddingError.message);
+  }
 
   return {
     content: [{ type: "text", text: deleteResponse.ok
