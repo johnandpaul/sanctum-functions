@@ -895,6 +895,19 @@ server.registerTool('vault_health_check', {
     }
   }
 
+  const staleEmbeddings: string[] = []
+  const { data: embeddingRows } = await supabase
+    .from('note_embeddings')
+    .select('path')
+  if (embeddingRows) {
+    const vaultSet = new Set(allNotes)
+    for (const row of embeddingRows) {
+      if (!vaultSet.has(row.path)) {
+        staleEmbeddings.push(row.path)
+      }
+    }
+  }
+
   const sections: string[] = [`🔍 Vault Health Report — ${allNotes.length} notes scanned`]
 
   sections.push(`\n## Missing/Empty Project Frontmatter (${missingProject.length})`)
@@ -911,6 +924,9 @@ server.registerTool('vault_health_check', {
 
   sections.push(`\n## Sparse Notes <100 chars (${sparseNotes.length})`)
   sections.push(sparseNotes.length ? sparseNotes.map(p => `  - ${p}`).join('\n') : '  ✅ None')
+
+  sections.push(`\n## Stale Embedding Paths (${staleEmbeddings.length})`)
+  sections.push(staleEmbeddings.length ? staleEmbeddings.map(p => `  - ${p}`).join('\n') : '  ✅ None')
 
   return { content: [{ type: "text", text: sections.join('\n') }] }
 })
