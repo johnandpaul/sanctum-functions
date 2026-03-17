@@ -74,6 +74,19 @@ Deno.serve(async (req) => {
       transcript = event.text
     }
 
+    // Guard: skip empty or hallucinated transcripts
+    const WHISPER_HALLUCINATIONS = [
+      'thank you for watching',
+      'thanks for watching',
+      'please subscribe',
+      'like and subscribe',
+    ]
+    const trimmed = transcript.trim()
+    const isHallucination = WHISPER_HALLUCINATIONS.some(p => trimmed.toLowerCase().includes(p))
+    if (!trimmed || trimmed.length < 3 || isHallucination) {
+      return new Response('OK', { status: 200 })
+    }
+
     // 6. Classification with Claude Haiku
     let category = 'general'
     let project = 'none'
