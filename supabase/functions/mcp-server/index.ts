@@ -10,6 +10,7 @@ const OBSIDIAN_API_KEY = Deno.env.get("OBSIDIAN_API_KEY")!;
 const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+const SUPADATA_API_KEY = Deno.env.get("GET_YOUTUBE_TRANSCRIPTS")!;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
@@ -48,9 +49,10 @@ server.registerTool('save_brainstorm', {
     actions: z.array(z.string()).optional().describe("Action items or next steps"),
     raw: z.string().optional().describe("Full context or raw notes"),
     project: z.string().optional().describe("Project: sigyls, dallas-tub-fix, or leave empty"),
-    tags: z.array(z.string()).optional().describe("Hierarchical tags like sigyls/strategy")
+    tags: z.array(z.string()).optional().describe("Hierarchical tags like sigyls/strategy"),
+    source_chat_url: z.string().optional().describe("URL of the Claude chat where this brainstorm originated")
   }
-}, async ({ title, summary, insights, actions, raw, project, tags }) => {
+}, async ({ title, summary, insights, actions, raw, project, tags, source_chat_url }) => {
   const today = new Date().toISOString().split("T")[0];
   const tagList = tags ? tags.join(", ") : "";
   const note = `---
@@ -60,11 +62,11 @@ tags: [${tagList}]
 created: ${today}
 source: claude-chat
 project: ${project || ""}
-source_chat_url: ""
+source_chat_url: "${source_chat_url || ""}"
 edit_history:
   - date: ${today}
     action: created
-    chat_url: ""
+    chat_url: "${source_chat_url || ""}"
 ---
 
 # ${title}
@@ -166,11 +168,12 @@ server.registerTool('save_artifact', {
     title: z.string().describe("Short descriptive title for the artifact"),
     content: z.string().describe("The full content of the artifact"),
     summary: z.string().describe("2-3 sentence description of what this artifact is and why it matters"),
-    project: z.string().optional().describe("Project: sigyls, dallas-tub-fix, sanctum, or leave empty for general resources"),
+    project: z.string().optional().describe("Project: sigyls, dallas-tub-fix, sanctum, sono, turnkey, or leave empty for general resources"),
     tags: z.array(z.string()).optional().describe("Hierarchical tags like sigyls/architecture or sigyls/ux-design"),
-    artifact_type: z.string().optional().describe("Type of artifact: spec, design, diagram, research, template, other")
+    artifact_type: z.string().optional().describe("Type of artifact: spec, design, diagram, research, template, other"),
+    source_chat_url: z.string().optional().describe("URL of the Claude chat where this artifact originated")
   }
-}, async ({ title, summary, content, project, tags, artifact_type }) => {
+}, async ({ title, summary, content, project, tags, artifact_type, source_chat_url }) => {
   const today = new Date().toISOString().split("T")[0];
   const tagList = tags ? tags.join(", ") : "";
   const folder = project
@@ -185,11 +188,11 @@ tags: [${tagList}]
 created: ${today}
 source: claude-chat
 project: ${project || ""}
-source_chat_url: ""
+source_chat_url: "${source_chat_url || ""}"
 edit_history:
   - date: ${today}
     action: created
-    chat_url: ""
+    chat_url: "${source_chat_url || ""}"
 ---
 
 # ${title}
@@ -272,9 +275,10 @@ server.registerTool('edit_note', {
     find: z.string().optional().describe("Text to find (for find_replace mode)"),
     replace: z.string().optional().describe("Text to replace with (for find_replace mode)"),
     field: z.string().optional().describe("Frontmatter field name to update (for frontmatter mode)"),
-    value: z.string().optional().describe("New value for the frontmatter field (for frontmatter mode)")
+    value: z.string().optional().describe("New value for the frontmatter field (for frontmatter mode)"),
+    chat_url: z.string().optional().describe("URL of the Claude chat where this edit is being made")
   }
-}, async ({ path, mode, content, find, replace, field, value }) => {
+}, async ({ path, mode, content, find, replace, field, value, chat_url }) => {
   const readResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   });
@@ -295,7 +299,7 @@ server.registerTool('edit_note', {
   }
 
   const today = new Date().toISOString().split("T")[0];
-  const newHistoryEntry = `  - date: ${today}\n    action: edited\n    same_as_creator: false\n    chat_url: ""`;
+  const newHistoryEntry = `  - date: ${today}\n    action: edited\n    same_as_creator: false\n    chat_url: "${chat_url || ""}"`;
   const fmEnd = noteContent.indexOf('\n---\n', 3);
   if (fmEnd !== -1 && noteContent.includes('edit_history:')) {
     noteContent = noteContent.slice(0, fmEnd) + '\n' + newHistoryEntry + noteContent.slice(fmEnd);
@@ -1481,6 +1485,28 @@ server.registerTool('home_protocol', {
   lines.push("Pull up today's chats in your sidebar and share the URLs when ready.");
 
   return { content: [{ type: "text", text: lines.join('\n') }] };
+})
+
+server.registerTool('get_youtube_transcript', {
+  title: 'Get YouTube Transcript',
+  description: "Fetch the transcript of a YouTube video by URL. Use when John pastes a YouTube link and wants to analyze, discuss, or extract insights from the video content.",
+  inputSchema: {
+    url: z.string().describe("The YouTube video URL, e.g. https://youtu.be/abc123 or https://www.youtube.com/watch?v=abc123")
+  }
+}, async ({ url }) => {
+  const response = await fetch(`https://api.supadata.ai/v1/youtube/transcript?url=${encodeURIComponent(url)}&text=true`, {
+    headers: {
+      "x-api-key": SUPADATA_API_KEY
+    }
+  });
+  if (!response.ok) {
+    return { content: [{ type: "text", text: `❌ Failed to fetch transcript: ${response.status} ${response.statusText}` }] };
+  }
+  const data = await response.json();
+  const transcript = data.content || data.transcript || data.text || JSON.stringify(data);
+  return {
+    content: [{ type: "text", text: `✅ Transcript fetched\n\n${transcript}` }]
+  };
 })
 
 app.all('*', async (c) => {
