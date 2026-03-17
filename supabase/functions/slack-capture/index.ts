@@ -9,6 +9,11 @@ const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
 
 Deno.serve(async (req) => {
   try {
+    // Guard: ignore Slack retries
+    if (req.headers.get('X-Slack-Retry-Num')) {
+      return new Response('OK', { status: 200 })
+    }
+
     const body = await req.json()
 
     // 1. Slack URL verification
