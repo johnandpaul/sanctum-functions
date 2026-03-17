@@ -1,4 +1,5 @@
 import 'jsr:@supabase/functions-js/edge-runtime.d.ts'
+import { postToLogs } from '../_shared/slack-logger.ts'
 
 const SLACK_BOT_TOKEN = Deno.env.get('SLACK_BOT_TOKEN')!
 const OPENAI_API_KEY = Deno.env.get('OPENAI_API_KEY')!
@@ -149,6 +150,9 @@ Deno.serve(async (req) => {
       console.error('Supabase insert error:', err)
     }
 
+    // Log success to #logs
+    await postToLogs(`*slack-capture* ✓ ${category} — ${project} | "${transcript.slice(0, 60)}${transcript.length > 60 ? '…' : ''}"`)
+
     // 8. Post confirmation back to Slack
     try {
       await fetch('https://slack.com/api/chat.postMessage', {
@@ -169,6 +173,7 @@ Deno.serve(async (req) => {
     return new Response('OK', { status: 200 })
   } catch (err) {
     console.error('Unhandled error:', err)
+    await postToLogs(`*slack-capture* ⚠️ Unhandled error: ${err instanceof Error ? err.message : String(err)}`)
     return new Response('OK', { status: 200 })
   }
 })
