@@ -14,6 +14,10 @@ const SUPADATA_API_KEY = Deno.env.get("GET_YOUTUBE_TRANSCRIPTS")!;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
+function encodedVaultPath(path: string): string {
+  return path.split('/').map((s: string) => s ? encodeURIComponent(s) : s).join('/');
+}
+
 const app = new Hono()
 const server = new McpServer({ name: 'sanctum-vault', version: '1.0.0' })
 
@@ -131,7 +135,7 @@ server.registerTool('browse_vault', {
   }
 }, async ({ folder }) => {
   const path = folder ? `${folder.replace(/\/$/, '')}/` : '';
-  const response = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+  const response = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(path)}`, {
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   });
   if (!response.ok) return { content: [{ type: "text", text: `❌ Could not browse: ${path || 'root'}` }] };
@@ -151,7 +155,7 @@ server.registerTool('read_note', {
     path: z.string().describe("Full path to the note, e.g. '01-projects/sigyls/2026-02-28-ada-design.md'")
   }
 }, async ({ path }) => {
-  const response = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+  const response = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(path)}`, {
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   });
   if (!response.ok) return { content: [{ type: "text", text: `❌ Note not found: ${path}` }] };
@@ -256,7 +260,7 @@ server.registerTool('delete_note', {
     path: z.string().describe("Full path to the note, e.g. '01-projects/sigyls/2026-03-01-old-note.md'")
   }
 }, async ({ path }) => {
-  const response = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+  const response = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(path)}`, {
     method: "DELETE",
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   });
@@ -279,7 +283,7 @@ server.registerTool('edit_note', {
     chat_url: z.string().optional().describe("URL of the Claude chat where this edit is being made")
   }
 }, async ({ path, mode, content, find, replace, field, value, chat_url }) => {
-  const readResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+  const readResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(path)}`, {
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   });
   if (!readResponse.ok) return { content: [{ type: "text", text: `❌ Note not found: ${path}` }] };
@@ -305,7 +309,7 @@ server.registerTool('edit_note', {
     noteContent = noteContent.slice(0, fmEnd) + '\n' + newHistoryEntry + noteContent.slice(fmEnd);
   }
 
-  const writeResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+  const writeResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(path)}`, {
     method: "PUT",
     headers: {
       "Authorization": `Bearer ${OBSIDIAN_API_KEY}`,
@@ -351,7 +355,7 @@ server.registerTool('vault_profile_sync', {
       .reverse()[0]
     if (!statusFile) continue
     const path = `01-projects/${project}/${statusFile}`
-    const res = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+    const res = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(path)}`, {
       headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
     })
     if (res.ok) {
@@ -371,7 +375,7 @@ server.registerTool('vault_profile_sync', {
     const latest = handoffFiles.sort().reverse()[0]
     if (!latest) continue
     const path = `01-projects/${project}/${latest}`
-    const noteRes = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+    const noteRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(path)}`, {
       headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
     })
     if (noteRes.ok) {
@@ -399,7 +403,7 @@ server.registerTool('vault_profile_sync', {
       const path = `01-projects/${project}/${file}`
       // Skip if already collected in Layer 1 or 2
       if (notes.some(n => n.path === path)) continue
-      const noteRes = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+      const noteRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(path)}`, {
         headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
       })
       if (noteRes.ok) {
@@ -571,7 +575,7 @@ server.registerTool('rename_note', {
   const folder = path.substring(0, path.lastIndexOf('/') + 1);
   const new_path = folder + new_name;
 
-  const readResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+  const readResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(path)}`, {
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   });
   if (!readResponse.ok) return { content: [{ type: "text", text: `❌ Note not found: ${path}` }] };
@@ -584,7 +588,7 @@ server.registerTool('rename_note', {
   });
   if (!writeResponse.ok) return { content: [{ type: "text", text: `❌ Failed to write to: ${new_path}` }] };
 
-  const deleteResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+  const deleteResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(path)}`, {
     method: "DELETE",
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   });
@@ -642,7 +646,7 @@ server.registerTool('clean_note_structure', {
     path: z.string().describe("Full path to the note to clean, e.g. '01-projects/sigyls/2026-03-01-my-note.md'")
   }
 }, async ({ path }) => {
-  const readResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+  const readResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(path)}`, {
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   });
   if (!readResponse.ok) return { content: [{ type: "text", text: `❌ Note not found: ${path}` }] };
@@ -669,7 +673,7 @@ server.registerTool('clean_note_structure', {
   const deduped = [...wikilinks];
   const updated = cleaned.trimEnd() + '\n\n## Related\n' + (deduped.length ? deduped.join('\n') + '\n' : '');
 
-  const writeResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+  const writeResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(path)}`, {
     method: "PUT",
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}`, "Content-Type": "text/markdown" },
     body: updated,
@@ -1264,7 +1268,7 @@ server.registerTool('get_tasks', {
 
     const summaryLines: string[] = []
     for (const { path, date } of dailyNotePaths) {
-      const res = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, { headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` } })
+      const res = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(path)}`, { headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` } })
       if (!res.ok) continue
       const content = await res.text()
       const completed = (content.match(/^- \[x\]/gim) || []).length
@@ -1355,7 +1359,7 @@ server.registerTool('complete_task', {
     task_text: z.string().describe("Text of the task to mark complete (partial match, case-insensitive)")
   }
 }, async ({ path, task_text }) => {
-  const readRes = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+  const readRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(path)}`, {
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   })
   if (!readRes.ok) return { content: [{ type: "text", text: `❌ Note not found: ${path}` }] }
@@ -1371,7 +1375,7 @@ server.registerTool('complete_task', {
   const matchedLine = lines[matchIdx]
   lines[matchIdx] = matchedLine.replace('- [ ]', '- [x]')
 
-  const writeRes = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+  const writeRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(path)}`, {
     method: "PUT",
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}`, "Content-Type": "text/markdown" },
     body: lines.join('\n'),
