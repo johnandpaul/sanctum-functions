@@ -650,7 +650,7 @@ server.registerTool('clean_note_structure', {
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   });
   if (!readResponse.ok) return { content: [{ type: "text", text: `❌ Note not found: ${path}` }] };
-  const noteContent = await readResponse.text();
+  const noteContent = (await readResponse.text()).replace(/\r\n/g, '\n');
 
   const relatedSectionRegex = /## Related\n([\s\S]*?)(?=\n## |$)/g;
   const wikilinks = new Set<string>();
