@@ -3,8 +3,12 @@ import 'jsr:@supabase/functions-js/edge-runtime.d.ts'
 const OBSIDIAN_API_URL = Deno.env.get("OBSIDIAN_API_URL")!;
 const OBSIDIAN_API_KEY = Deno.env.get("OBSIDIAN_API_KEY")!;
 
+function encodedVaultPath(path: string): string {
+  return path.split('/').map((s: string) => s ? encodeURIComponent(s) : s).join('/');
+}
+
 async function getNoteContent(path: string): Promise<string | null> {
-  const response = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+  const response = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(path)}`, {
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   });
   if (!response.ok) return null;
@@ -12,7 +16,7 @@ async function getNoteContent(path: string): Promise<string | null> {
 }
 
 async function writeNoteContent(path: string, content: string): Promise<boolean> {
-  const response = await fetch(`${OBSIDIAN_API_URL}/vault/${path}`, {
+  const response = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(path)}`, {
     method: "PUT",
     headers: {
       "Authorization": `Bearer ${OBSIDIAN_API_KEY}`,
@@ -27,7 +31,7 @@ async function findNotePath(filename: string): Promise<string | null> {
   // Search common folders for the note
   const folders = ['00-inbox/', '01-projects/sigyls/', '01-projects/dallas-tub-fix/', '01-projects/sanctum/', '01-projects/sono/', '01-projects/turnkey/', '02-areas/', '03-resources/'];
   for (const folder of folders) {
-    const response = await fetch(`${OBSIDIAN_API_URL}/vault/${folder}`, {
+    const response = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(folder)}`, {
       headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
     });
     if (!response.ok) continue;

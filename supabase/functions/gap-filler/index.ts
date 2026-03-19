@@ -4,12 +4,16 @@ const OBSIDIAN_API_URL = Deno.env.get("OBSIDIAN_API_URL")!;
 const OBSIDIAN_API_KEY = Deno.env.get("OBSIDIAN_API_KEY")!;
 const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
 
+function encodedVaultPath(path: string): string {
+  return path.split('/').map((s: string) => s ? encodeURIComponent(s) : s).join('/');
+}
+
 // Get all notes from vault recursively
 async function getAllNotes(): Promise<{path: string, content: string}[]> {
   const notes: {path: string, content: string}[] = [];
   
   async function readFolder(folderPath: string) {
-    const response = await fetch(`${OBSIDIAN_API_URL}/vault/${folderPath}`, {
+    const response = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(folderPath)}`, {
       headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
     });
     if (!response.ok) return;
@@ -21,7 +25,7 @@ async function getAllNotes(): Promise<{path: string, content: string}[]> {
         await readFolder(`${folderPath}${file}`);
       } else if (file.endsWith('.md') && !file.includes('_templates')) {
         // It's a markdown note — read it
-        const noteResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${folderPath}${file}`, {
+        const noteResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(folderPath + file)}`, {
           headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
         });
         if (noteResponse.ok) {
@@ -151,7 +155,7 @@ Review each proposed connection above. Delete any connections you don't want app
 When ready, click "Approve & Apply" in the email notification.
 `;
 
-    const writeResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${fileName}`, {
+    const writeResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(fileName)}`, {
       method: 'PUT',
       headers: {
         'Authorization': `Bearer ${OBSIDIAN_API_KEY}`,
