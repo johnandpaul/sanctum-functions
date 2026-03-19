@@ -23,7 +23,7 @@ const server = new McpServer({ name: 'sanctum-vault', version: '1.0.0' })
 
 async function getAllVaultNotes(folderPath = ''): Promise<string[]> {
   const urlPath = folderPath ? `${folderPath}/` : ''
-  const res = await fetch(`${OBSIDIAN_API_URL}/vault/${urlPath}`, {
+  const res = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(urlPath)}`, {
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   })
   if (!res.ok) return []
@@ -716,7 +716,7 @@ server.registerTool('delete_folder', {
   }
 }, async ({ folder_path, force }) => {
   const cleanPath = folder_path.replace(/\/+$/, '')
-  const listResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${cleanPath}/`, {
+  const listResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(cleanPath)}/`, {
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   })
   if (!listResponse.ok) {
@@ -732,7 +732,7 @@ server.registerTool('delete_folder', {
   }
   const results: string[] = []
   for (const file of files) {
-    const delResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${cleanPath}/${file}`, {
+    const delResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(cleanPath)}/${encodedVaultPath(file)}`, {
       method: "DELETE",
       headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
     })
@@ -755,7 +755,7 @@ server.registerTool('rename_folder', {
   const cleanPath = folder_path.replace(/\/+$/, '')
   const parent = cleanPath.substring(0, cleanPath.lastIndexOf('/'))
   const newPath = parent ? `${parent}/${new_name}` : new_name
-  const listResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${cleanPath}/`, {
+  const listResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(cleanPath)}/`, {
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   })
   if (!listResponse.ok) {
@@ -765,18 +765,18 @@ server.registerTool('rename_folder', {
   const files: string[] = listing.files ?? []
   const results: string[] = []
   for (const file of files) {
-    const readResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${cleanPath}/${file}`, {
+    const readResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(cleanPath)}/${encodedVaultPath(file)}`, {
       headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
     })
     if (!readResponse.ok) { results.push(`❌ Failed to read: ${file}`); continue }
     const content = await readResponse.text()
-    const writeResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${newPath}/${file}`, {
+    const writeResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(newPath)}/${encodedVaultPath(file)}`, {
       method: "PUT",
       headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}`, "Content-Type": "text/markdown" },
       body: content,
     })
     if (!writeResponse.ok) { results.push(`❌ Failed to write: ${file}`); continue }
-    const delResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${cleanPath}/${file}`, {
+    const delResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(cleanPath)}/${encodedVaultPath(file)}`, {
       method: "DELETE",
       headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
     })
@@ -798,7 +798,7 @@ server.registerTool('move_folder', {
 }, async ({ source_path, destination_path }) => {
   const cleanSource = source_path.replace(/\/+$/, '')
   const cleanDest = destination_path.replace(/\/+$/, '')
-  const listResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${cleanSource}/`, {
+  const listResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(cleanSource)}/`, {
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   })
   if (!listResponse.ok) {
@@ -808,18 +808,18 @@ server.registerTool('move_folder', {
   const files: string[] = listing.files ?? []
   const results: string[] = []
   for (const file of files) {
-    const readResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${cleanSource}/${file}`, {
+    const readResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(cleanSource)}/${encodedVaultPath(file)}`, {
       headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
     })
     if (!readResponse.ok) { results.push(`❌ Failed to read: ${file}`); continue }
     const content = await readResponse.text()
-    const writeResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${cleanDest}/${file}`, {
+    const writeResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(cleanDest)}/${encodedVaultPath(file)}`, {
       method: "PUT",
       headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}`, "Content-Type": "text/markdown" },
       body: content,
     })
     if (!writeResponse.ok) { results.push(`❌ Failed to write: ${file}`); continue }
-    const delResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${cleanSource}/${file}`, {
+    const delResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(cleanSource)}/${encodedVaultPath(file)}`, {
       method: "DELETE",
       headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
     })
@@ -961,7 +961,7 @@ server.registerTool('get_project_brief', {
   }
 }, async ({ project }) => {
   const folderPath = `01-projects/${project}`
-  const listRes = await fetch(`${OBSIDIAN_API_URL}/vault/${folderPath}/`, {
+  const listRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(folderPath)}/`, {
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   })
   if (!listRes.ok) {
@@ -1002,7 +1002,7 @@ server.registerTool('update_project_status', {
   const targetPath = `${folderPath}/status.md`
 
   // Find and delete any existing status file at a different path
-  const listRes = await fetch(`${OBSIDIAN_API_URL}/vault/${folderPath}/`, {
+  const listRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(folderPath)}/`, {
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   })
   if (listRes.ok) {
@@ -1012,7 +1012,7 @@ server.registerTool('update_project_status', {
       .sort()
       .reverse()[0]
     if (existingStatus && existingStatus !== 'status.md') {
-      await fetch(`${OBSIDIAN_API_URL}/vault/${folderPath}/${existingStatus}`, {
+      await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(folderPath)}/${encodedVaultPath(existingStatus)}`, {
         method: "DELETE",
         headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
       })
@@ -1328,7 +1328,7 @@ server.registerTool('add_task', {
     return { content: [{ type: "text", text: `❌ Unknown destination: "${destination}". Use: staging, personal, daily, tca-daily, tca-weekly, tca-monthly` }] }
   }
 
-  const readRes = await fetch(`${OBSIDIAN_API_URL}/vault/${target.file}`, {
+  const readRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(target.file)}`, {
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   })
   if (!readRes.ok) {
@@ -1338,7 +1338,7 @@ server.registerTool('add_task', {
   const content = await readRes.text()
   const updated = insertIntoSection(content, target.section, `- [ ] ${task}`)
 
-  const writeRes = await fetch(`${OBSIDIAN_API_URL}/vault/${target.file}`, {
+  const writeRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(target.file)}`, {
     method: "PUT",
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}`, "Content-Type": "text/markdown" },
     body: updated,
