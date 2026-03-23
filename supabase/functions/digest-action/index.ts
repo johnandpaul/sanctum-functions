@@ -11,6 +11,7 @@ const FOLDER_MAP: Record<string, string> = {
   "turnkey": "01-projects/turnkey",
   "archive": "04-archive/digest",
   "intelligence": "02-areas/intelligence",
+  "iconic-roofing": "01-projects/iconic-roofing",
 };
 
 function successPage(message: string): Response {
