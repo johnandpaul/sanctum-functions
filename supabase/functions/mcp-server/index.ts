@@ -206,6 +206,8 @@ ${summary}
 
 ## Content
 ${content}
+
+## Related
 `;
 
   const fileName = `${folder}/${today}-${title.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "")}.md`;
@@ -845,6 +847,8 @@ server.registerTool('vault_health_check', {
   const phantomFolders = new Set<string>()
   const wrongFolder: { path: string, project: string, expected: string }[] = []
   const sparseNotes: string[] = []
+  const zeroLinks: string[] = []
+  const brokenRelated: string[] = []
 
   const projectFolderMap: Record<string, string> = {
     'sono': '01-projects/sono',
@@ -903,6 +907,22 @@ server.registerTool('vault_health_check', {
     if (body.length < 100) {
       sparseNotes.push(notePath)
     }
+
+    // f. Zero outbound wikilinks — body has no [[...]] at all
+    const filename = notePath.substring(notePath.lastIndexOf('/') + 1)
+    const isLinklessByDesign = (
+      filename === 'staging.md' ||
+      filename.startsWith('tca-duties') ||
+      /^\d{4}-\d{2}-\d{2}-.*task.*\.md$/.test(filename)
+    )
+    if (!isLinklessByDesign && !sparseNotes.includes(notePath) && !/\[\[/.test(body)) {
+      zeroLinks.push(notePath)
+    }
+
+    // g. Broken Related placeholder — "## Related\n- " with nothing meaningful after the hyphen
+    if (/^## Related\s*\n- \s*$/m.test(content)) {
+      brokenRelated.push(notePath)
+    }
   }
 
   const staleEmbeddings: string[] = []
@@ -934,6 +954,12 @@ server.registerTool('vault_health_check', {
 
   sections.push(`\n## Sparse Notes <100 chars (${sparseNotes.length})`)
   sections.push(sparseNotes.length ? sparseNotes.map(p => `  - ${p}`).join('\n') : '  ✅ None')
+
+  sections.push(`\n## Zero Outbound Wikilinks (${zeroLinks.length})`)
+  sections.push(zeroLinks.length ? zeroLinks.map(p => `  - ${p}`).join('\n') : '  ✅ None')
+
+  sections.push(`\n## Broken Related Placeholder (${brokenRelated.length})`)
+  sections.push(brokenRelated.length ? brokenRelated.map(p => `  - ${p}`).join('\n') : '  ✅ None')
 
   sections.push(`\n## Stale Embedding Paths (${staleEmbeddings.length})`)
   sections.push(staleEmbeddings.length ? staleEmbeddings.map(p => `  - ${p}`).join('\n') : '  ✅ None')
@@ -1017,6 +1043,18 @@ server.registerTool('update_project_status', {
         headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
       })
     }
+  }
+
+  const relatedLinks: Record<string, string[]> = {
+    sigyls: ['[[sigyls-foundry-workshop-framework-suite-v10]]', '[[sigyls-foundry-workshop-framework-suite-v11]]'],
+    'dallas-tub-fix': ['[[cipher-agent-production]]'],
+    sanctum: ['[[sanctum-master-build-reference--complete-state]]'],
+    sono: ['[[sono-ai-agent-ecosystem]]'],
+    turnkey: ['[[turnkey-foundry-timeline]]'],
+  }
+  const links = relatedLinks[project]
+  if (links && !content.includes('## Related')) {
+    content = content.trimEnd() + '\n\n## Related\n' + links.map(l => `- ${l}`).join('\n') + '\n'
   }
 
   const writeRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(targetPath)}`, {

@@ -101,6 +101,9 @@ date: ${today}
 ${summary}
 
 ${articleUrl ? `[Read article](${articleUrl})` : ''}
+
+## Related
+- [[2026-03-16-ai-daily-digest--master-index]]
 `;
     await fetch(`${OBSIDIAN_API_URL}/vault/04-archive/digest/${fileName}`, {
       method: "PUT",
@@ -132,6 +135,9 @@ ${summary}
 💡 ${whyItMatters}
 
 ${articleUrl ? `[Read article](${articleUrl})` : ''}
+
+## Related
+- [[2026-03-16-ai-daily-digest--master-index]]
 `;
     await fetch(`${OBSIDIAN_API_URL}/vault/${folder}/${fileName}`, {
       method: "PUT",
@@ -166,6 +172,9 @@ ${summary}
 ✅ Recommended: ${recommendedAction}
 
 ${articleUrl ? `[Read article](${articleUrl})` : ''}
+
+## Related
+- [[2026-03-16-ai-daily-digest--master-index]]
 `;
 
   const writeResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${folder}/${fileName}`, {
