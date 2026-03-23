@@ -118,7 +118,7 @@ server.registerTool('search_vault', {
 }, async ({ query }) => {
   const response = await fetch(
     `${OBSIDIAN_API_URL}/search/simple/?query=${encodeURIComponent(query)}&contextLength=100`,
-    { headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` } }
+    { method: 'POST', headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` } }
   );
   if (!response.ok) {
     const errorBody = await response.text();
