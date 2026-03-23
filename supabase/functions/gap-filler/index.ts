@@ -76,7 +76,7 @@ Deno.serve(async (req) => {
       project: (n.content.match(/^project:\s*(.+)$/m) || [])[1]?.trim() || '',
       existingLinks: [...n.content.matchAll(/\[\[([^\]]+)\]\]/g)].map(m => m[1])
     }));
-
+    noteIndex.sort((a, b) => a.existingLinks.length - b.existingLinks.length);
     // Send to Claude for gap analysis
     const claudeResponse = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -90,7 +90,7 @@ Deno.serve(async (req) => {
         max_tokens: 2000,
         messages: [{
           role: 'user',
-          content: `You are a knowledge graph analyst for John's personal Obsidian vault. Analyze these notes and identify missing connections that would strengthen the knowledge graph.
+          content: `You are a knowledge graph analyst for John's personal Obsidian vault. Analyze these notes and identify missing connections that would strengthen the knowledge graph. Prioritize notes with zero or very few existing links - these are the most isolated and need connections most urgently.
 
 Note index:
 ${JSON.stringify(noteIndex, null, 2)}
