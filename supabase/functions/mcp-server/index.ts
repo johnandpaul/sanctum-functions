@@ -117,15 +117,8 @@ server.registerTool('search_vault', {
   inputSchema: { query: z.string().describe("Search term or topic") }
 }, async ({ query }) => {
   const response = await fetch(
-    `${OBSIDIAN_API_URL}/search/simple/`,
-    {
-      method: 'POST',
-      headers: {
-        "Authorization": `Bearer ${OBSIDIAN_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ query, contextLength: 100 })
-    }
+    `${OBSIDIAN_API_URL}/search/simple/?query=${encodeURIComponent(query)}&contextLength=100`,
+    { headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` } }
   );
   if (!response.ok) {
     const errorBody = await response.text();
