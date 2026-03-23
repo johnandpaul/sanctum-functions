@@ -120,7 +120,10 @@ server.registerTool('search_vault', {
     `${OBSIDIAN_API_URL}/search/simple/?query=${encodeURIComponent(query)}&contextLength=100`,
     { headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` } }
   );
-  if (!response.ok) return { content: [{ type: "text", text: "Search failed" }] };
+  if (!response.ok) {
+    const errorBody = await response.text();
+    return { content: [{ type: "text", text: `Search failed — HTTP ${response.status}: ${errorBody}` }] };
+  }
   const results = await response.json();
   return {
     content: [{ type: "text", text: results.length ? JSON.stringify(results.slice(0, 5), null, 2) : `No notes found for: ${query}` }]
