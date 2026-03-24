@@ -11,8 +11,23 @@ const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const SUPADATA_API_KEY = Deno.env.get("GET_YOUTUBE_TRANSCRIPTS")!;
+const GITHUB_TOKEN = Deno.env.get("GITHUB_TOKEN")!;
+const GITHUB_REPO = "johnandpaul/vault";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+async function readNoteFromGitHub(path: string): Promise<string | null> {
+  const encodedPath = path.split('/').map(s => encodeURIComponent(s)).join('/');
+  const res = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/contents/${encodedPath}`, {
+    headers: {
+      "Authorization": `Bearer ${GITHUB_TOKEN}`,
+      "Accept": "application/vnd.github.v3.raw",
+      "User-Agent": "sanctum-mcp-server"
+    }
+  });
+  if (!res.ok) return null;
+  return await res.text();
+}
 
 function encodedVaultPath(path: string): string {
   return path.split('/').map((s: string) => s ? encodeURIComponent(s) : s).join('/');
@@ -161,11 +176,16 @@ server.registerTool('read_note', {
   const response = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(path)}`, {
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   });
-  if (!response.ok) return { content: [{ type: "text", text: `❌ Note not found: ${path}` }] };
-  const content = await response.text();
-  return {
-    content: [{ type: "text", text: `📄 ${path}\n\n${content}` }]
-  };
+  if (response.ok) {
+    const content = await response.text();
+    return { content: [{ type: "text", text: `📄 ${path}\n\n${content}` }] };
+  }
+  // Obsidian unavailable — try GitHub fallback
+  const githubContent = await readNoteFromGitHub(path);
+  if (githubContent) {
+    return { content: [{ type: "text", text: `📄 ${path} *(via GitHub fallback)*\n\n${githubContent}` }] };
+  }
+  return { content: [{ type: "text", text: `❌ Note not found: ${path} (Obsidian offline and not found on GitHub)` }] };
 })
 
 server.registerTool('save_artifact', {
