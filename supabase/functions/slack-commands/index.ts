@@ -4,8 +4,8 @@ import { postToLogs } from '../_shared/slack-logger.ts'
 const SLACK_BOT_TOKEN = Deno.env.get('SLACK_BOT_TOKEN')!
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
-const MCP_URL = 'https://ozezxrmaoukpqjshimys.supabase.co/functions/v1/mcp-server'
-const MCP_ANON_KEY = Deno.env.get('SUPABASE_ANON_KEY')!
+const OBSIDIAN_API_URL = Deno.env.get('OBSIDIAN_API_URL')!
+const OBSIDIAN_API_KEY = Deno.env.get('OBSIDIAN_API_KEY')!
 
 async function postToSlack(channel: string, text: string) {
   await fetch('https://slack.com/api/chat.postMessage', {
@@ -18,23 +18,98 @@ async function postToSlack(channel: string, text: string) {
   })
 }
 
-async function callMcpTool(toolName: string, args: Record<string, unknown>): Promise<string> {
-  const response = await fetch(MCP_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${MCP_ANON_KEY}`
-    },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'tools/call',
-      params: { name: toolName, arguments: args }
-    })
+async function getStagingBacklog(): Promise<string> {
+  const response = await fetch(`${OBSIDIAN_API_URL}/vault/02-areas/tasks/staging.md`, {
+    headers: { 'Authorization': `Bearer ${OBSIDIAN_API_KEY}` }
   })
-  if (!response.ok) throw new Error(`MCP call failed: ${response.status}`)
-  const data = await response.json()
-  return data?.result?.content?.[0]?.text ?? '(no response)'
+  if (!response.ok) throw new Error(`Obsidian read failed: ${response.status}`)
+  return await response.text()
+}
+
+async function generateDailyNote(): Promise<string> {
+  const today = new Date().toISOString().split('T')[0]
+  const dayOfWeek = new Date().getDay()
+  const dayOfMonth = new Date().getDate()
+
+  const [stagingRes, tcaRes, personalRes] = await Promise.all([
+    fetch(`${OBSIDIAN_API_URL}/vault/02-areas/tasks/staging.md`, { headers: { 'Authorization': `Bearer ${OBSIDIAN_API_KEY}` } }),
+    fetch(`${OBSIDIAN_API_URL}/vault/02-areas/tasks/tca-duties.md`, { headers: { 'Authorization': `Bearer ${OBSIDIAN_API_KEY}` } }),
+    fetch(`${OBSIDIAN_API_URL}/vault/02-areas/tasks/personal.md`, { headers: { 'Authorization': `Bearer ${OBSIDIAN_API_KEY}` } }),
+  ])
+
+  if (!stagingRes.ok) throw new Error('Could not read staging.md')
+  if (!tcaRes.ok) throw new Error('Could not read tca-duties.md')
+
+  const stagingContent = await stagingRes.text()
+  const tcaContent = await tcaRes.text()
+  const personalContent = personalRes.ok ? await personalRes.text() : ''
+
+  function extractSection(content: string, header: string): string[] {
+    const lines = content.split('\n')
+    const startIdx = lines.findIndex(l => l.trim() === `## ${header}`)
+    if (startIdx === -1) return []
+    let endIdx = lines.length
+    for (let i = startIdx + 1; i < lines.length; i++) {
+      if (lines[i].startsWith('## ')) { endIdx = i; break }
+    }
+    return lines.slice(startIdx + 1, endIdx).filter(l => l.trim().startsWith('- '))
+  }
+
+  const backlogItems = extractSection(stagingContent, 'Backlog').slice(0, 10)
+  const stagingLines = backlogItems.map(item => `- [ ] ${item.replace(/^- \[[ x]\] /i, '')}`)
+
+  const tcaDailyLines = extractSection(tcaContent, 'Daily')
+  const tcaWeeklyLines = dayOfWeek === 1 ? extractSection(tcaContent, 'Weekly') : []
+  const tcaMonthlyLines = dayOfMonth === 1 ? extractSection(tcaContent, 'Monthly') : []
+  const tcaLines = [...tcaDailyLines, ...tcaWeeklyLines, ...tcaMonthlyLines]
+
+  const personalLines = extractSection(personalContent, 'Upcoming')
+
+  const note = `---
+type: daily-tasks
+status: active
+tags: [tasks/daily]
+created: ${today}
+project: sanctum
+---
+
+# Daily Tasks — ${today}
+
+## From Staging Backlog
+${stagingLines.length ? stagingLines.join('\n') : '(none)'}
+
+## TCA Duties
+${tcaLines.length ? tcaLines.join('\n') : '(none for today)'}
+
+## Personal
+${personalLines.length ? personalLines.join('\n') : '(none)'}
+
+## Notes
+`
+
+  const fileName = `00-inbox/${today}-daily-tasks.md`
+  const writeRes = await fetch(`${OBSIDIAN_API_URL}/vault/${fileName.split('/').map(s => encodeURIComponent(s)).join('/')}`, {
+    method: 'PUT',
+    headers: { 'Authorization': `Bearer ${OBSIDIAN_API_KEY}`, 'Content-Type': 'text/markdown' },
+    body: note,
+  })
+
+  if (!writeRes.ok) throw new Error('Failed to write daily note')
+  return `✅ Daily note created: ${fileName}\n\nTop items:\n${stagingLines.slice(0, 3).join('\n') || '(none)'}`
+}
+
+async function formatBacklogForSlack(content: string): Promise<string> {
+  const lines = content.split('\n')
+  const items: string[] = []
+  for (const line of lines) {
+    const trimmed = line.trim()
+    if (trimmed.startsWith('- [ ]')) {
+      items.push(trimmed.replace(/^- \[ \] /, '').trim())
+    }
+    if (items.length >= 10) break
+  }
+  if (!items.length) return '📋 *Staging Backlog:* Empty — nothing queued'
+  return `📋 *Staging Backlog (${items.length} items):*\n${items.map(i => `• ${i}`).join('\n')}`
 }
 
 async function getUnprocessedInbox(): Promise<string> {
@@ -88,10 +163,11 @@ Deno.serve(async (req) => {
 
     if (command === 'daily_note') {
       await postToSlack(channel, '⏳ Generating daily note...')
-      result = await callMcpTool('generate_daily_note', {})
+      result = await generateDailyNote()
     } else if (command === 'backlog') {
       await postToSlack(channel, '⏳ Fetching staging backlog...')
-      result = await callMcpTool('get_tasks', { scope: 'today' })
+      const content = await getStagingBacklog()
+      result = await formatBacklogForSlack(content)
     } else if (command === 'inbox') {
       await postToSlack(channel, '⏳ Checking capture inbox...')
       result = await getUnprocessedInbox()
