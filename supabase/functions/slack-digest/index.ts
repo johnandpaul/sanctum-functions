@@ -4,7 +4,7 @@ import { postToLogs } from '../_shared/slack-logger.ts'
 const SLACK_BOT_TOKEN = Deno.env.get('SLACK_BOT_TOKEN')!
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
-const CHANNEL_DIGEST = 'C0ANAJF5S3F'
+const CHANNEL_DIGEST = 'C0ALJT1SX6K'
 const MCP_URL = 'https://ozezxrmaoukpqjshimys.supabase.co/functions/v1/mcp-server'
 const MCP_ANON_KEY = Deno.env.get('SUPABASE_ANON_KEY')!
 
