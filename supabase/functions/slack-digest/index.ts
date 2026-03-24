@@ -5,8 +5,8 @@ const SLACK_BOT_TOKEN = Deno.env.get('SLACK_BOT_TOKEN')!
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
 const CHANNEL_DIGEST = 'C0ALJT1SX6K'
-const MCP_URL = 'https://ozezxrmaoukpqjshimys.supabase.co/functions/v1/mcp-server'
-const MCP_ANON_KEY = Deno.env.get('SUPABASE_ANON_KEY')!
+const OBSIDIAN_API_URL = Deno.env.get('OBSIDIAN_API_URL')!
+const OBSIDIAN_API_KEY = Deno.env.get('OBSIDIAN_API_KEY')!
 
 async function postToSlack(channel: string, text: string) {
   await fetch('https://slack.com/api/chat.postMessage', {
@@ -19,23 +19,12 @@ async function postToSlack(channel: string, text: string) {
   })
 }
 
-async function callMcpTool(toolName: string, args: Record<string, unknown>): Promise<string> {
-  const response = await fetch(MCP_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${MCP_ANON_KEY}`
-    },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'tools/call',
-      params: { name: toolName, arguments: args }
-    })
+async function getStagingBacklog(): Promise<string> {
+  const response = await fetch(`${OBSIDIAN_API_URL}/vault/02-areas/tasks/staging.md`, {
+    headers: { 'Authorization': `Bearer ${OBSIDIAN_API_KEY}` }
   })
-  if (!response.ok) throw new Error(`MCP call failed: ${response.status}`)
-  const data = await response.json()
-  return data?.result?.content?.[0]?.text ?? '(no response)'
+  if (!response.ok) throw new Error(`Obsidian read failed: ${response.status}`)
+  return await response.text()
 }
 
 async function getUnprocessedCount(): Promise<number> {
@@ -80,7 +69,7 @@ function extractBacklogItems(tasksText: string): string[] {
 
 Deno.serve(async (req) => {
   try {
-    const tasksText = await callMcpTool('get_tasks', { scope: 'today' })
+    const tasksText = await getStagingBacklog()
     const unprocessedCount = await getUnprocessedCount()
     const backlogItems = extractBacklogItems(tasksText)
 
