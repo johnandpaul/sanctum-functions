@@ -1502,56 +1502,6 @@ server.registerTool('update_staging', {
   }
 })
 
-server.registerTool('home_protocol', {
-  title: 'Home Protocol',
-  description: "Scans today's notes to find which ones need chat URLs backfilled. Run this when John says 'I'm home'.",
-  inputSchema: {}
-}, async () => {
-  const today = new Date().toISOString().split("T")[0];
-  const allNotes = await getAllVaultNotes();
-  const needsUrls: { path: string, count: number, multiChat: boolean }[] = [];
-
-  for (const notePath of allNotes) {
-    const res = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(notePath)}`, {
-      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
-    });
-    if (!res.ok) continue;
-    const content = await res.text();
-
-    const isFromToday = content.includes(`created: ${today}`) || content.includes(`  - date: ${today}`);
-    if (!isFromToday) continue;
-
-    const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
-    if (!fmMatch) continue;
-    const frontmatter = fmMatch[1];
-
-    const blankCount = (frontmatter.match(/chat_url:\s*""/g) || []).length;
-    if (blankCount === 0) continue;
-
-    needsUrls.push({
-      path: notePath,
-      count: blankCount,
-      multiChat: frontmatter.includes('same_as_creator: false')
-    });
-  }
-
-  if (needsUrls.length === 0) {
-    return { content: [{ type: "text", text: "✅ All notes from today have chat URLs filled in." }] };
-  }
-
-  const lines: string[] = [`${needsUrls.length} note${needsUrls.length > 1 ? 's' : ''} from today need chat URLs:\n`];
-  for (const { path, count, multiChat } of needsUrls) {
-    const name = path.split('/').pop() || path;
-    const label = multiChat
-      ? `${count} URLs needed (created by one chat, edited by another)`
-      : `${count} URL needed (created and edited by same chat)`;
-    lines.push(`• ${name}\n  → ${label}\n`);
-  }
-  lines.push("Pull up today's chats in your sidebar and share the URLs when ready.");
-
-  return { content: [{ type: "text", text: lines.join('\n') }] };
-})
-
 server.registerTool('get_youtube_transcript', {
   title: 'Get YouTube Transcript',
   description: "Fetch the transcript of a YouTube video by URL. Use when John pastes a YouTube link and wants to analyze, discuss, or extract insights from the video content.",
