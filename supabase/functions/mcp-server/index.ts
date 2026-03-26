@@ -1524,6 +1524,83 @@ server.registerTool('get_youtube_transcript', {
   };
 })
 
+server.registerTool('load_session_context', {
+  title: 'Load Session Context',
+  description: "Load full session context from the vault manifest. Called at the start of any session with 'load context' or 'load context [project]'. Returns base orientation notes, all project briefs, and optionally deep-reference notes for a specific project.",
+  inputSchema: {
+    project: z.string().optional().describe("Optional project name for deep-loading: sigyls, turnkey, dallas-tub-fix, sanctum, sono")
+  }
+}, async ({ project }) => {
+  const manifestPath = '01-projects/sanctum/2026-03-26-context-manifest.md'
+  const manifestRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(manifestPath)}`, {
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  })
+  if (!manifestRes.ok) {
+    return { content: [{ type: "text", text: `❌ Manifest not found at ${manifestPath}` }] }
+  }
+  const manifestContent = await manifestRes.text()
+
+  function parseManifestSection(content: string, sectionName: string): string[] {
+    const lines = content.split('\n')
+    const startIdx = lines.findIndex(l => l.trim() === `## ${sectionName}`)
+    if (startIdx === -1) return []
+    const paths: string[] = []
+    for (let i = startIdx + 1; i < lines.length; i++) {
+      const line = lines[i].trim()
+      if (line.startsWith('## ')) break
+      if (line.endsWith('.md') && !line.startsWith('#') && !line.startsWith('(')) {
+        paths.push(line)
+      }
+    }
+    return paths
+  }
+
+  const basePaths = parseManifestSection(manifestContent, 'base')
+  const projectPaths = project ? parseManifestSection(manifestContent, project) : []
+  const allPaths = [...basePaths, ...projectPaths]
+
+  const noteResults = await Promise.all(
+    allPaths.map(async (notePath) => {
+      const res = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(notePath)}`, {
+        headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+      })
+      if (!res.ok) return `\n\n---\n⚠️ Could not load: ${notePath}\n---`
+      const text = await res.text()
+      return `\n\n---\n## ${notePath}\n\n${text}`
+    })
+  )
+
+  const allProjects = ['dallas-tub-fix', 'sigyls', 'sanctum', 'sono', 'turnkey', 'iconic-roofing']
+  const briefResults = await Promise.all(
+    allProjects.map(async (proj) => {
+      const folderPath = `01-projects/${proj}`
+      const listRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(folderPath)}/`, {
+        headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+      })
+      if (!listRes.ok) return `\n\n---\n## Project Brief: ${proj}\n⚠️ Project folder not found\n---`
+      const data = await listRes.json()
+      const statusFile = (data.files || [])
+        .filter((f: string) => f.toLowerCase().includes('status') && f.endsWith('.md'))
+        .sort()
+        .reverse()[0]
+      if (!statusFile) return `\n\n---\n## Project Brief: ${proj}\nℹ️ No status note found\n---`
+      const notePath = `${folderPath}/${statusFile}`
+      const noteRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(notePath)}`, {
+        headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+      })
+      if (!noteRes.ok) return `\n\n---\n## Project Brief: ${proj}\n❌ Could not read status note\n---`
+      const content = await noteRes.text()
+      return `\n\n---\n## Project Brief: ${proj}\n📄 ${notePath}\n\n${content}`
+    })
+  )
+
+  const header = `# Session Context Loaded — ${new Date().toISOString().split('T')[0]}${project ? ` (+ ${project} deep-load)` : ''}\n\nBase notes: ${basePaths.length} | Project deep-load: ${projectPaths.length} | Project briefs: ${allProjects.length}`
+
+  const fullContext = header + noteResults.join('') + '\n\n---\n# Project Briefs\n' + briefResults.join('')
+
+  return { content: [{ type: "text", text: fullContext }] }
+})
+
 app.all('*', async (c) => {
   const transport = new WebStandardStreamableHTTPServerTransport()
   await server.connect(transport)
