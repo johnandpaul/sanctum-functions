@@ -90,6 +90,7 @@ Deno.serve(async (req) => {
   if (action === 'archive') {
     const content = `---
 type: digest-item
+purpose: "Archived digest item — noted but not immediately actionable for any current project."
 status: archived
 score: ${score}
 category: ${category}
@@ -121,6 +122,7 @@ ${articleUrl ? `[Read article](${articleUrl})` : ''}
     const folder = `02-areas/${folderName}`;
     const content = `---
 type: digest-item
+purpose: "Saved digest item filed under a custom topic — flagged as relevant but not tied to a named project."
 status: saved
 score: ${score}
 category: ${category}
@@ -154,6 +156,7 @@ ${articleUrl ? `[Read article](${articleUrl})` : ''}
 
   const content = `---
 type: digest-item
+purpose: "${whyItMatters}"
 status: saved
 score: ${score}
 category: ${category}
