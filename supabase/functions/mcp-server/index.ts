@@ -29,6 +29,20 @@ async function readNoteFromGitHub(path: string): Promise<string | null> {
   return await res.text();
 }
 
+async function listFolderFromGitHub(folderPath: string): Promise<string[] | null> {
+  const encodedPath = folderPath.split('/').map(s => encodeURIComponent(s)).join('/');
+  const res = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/contents/${encodedPath}`, {
+    headers: {
+      "Authorization": `Bearer ${GITHUB_TOKEN}`,
+      "Accept": "application/vnd.github.v3+json",
+      "User-Agent": "sanctum-mcp-server"
+    }
+  });
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data.map((entry: { name: string }) => entry.name);
+}
+
 function encodedVaultPath(path: string): string {
   return path.split('/').map((s: string) => s ? encodeURIComponent(s) : s).join('/');
 }
@@ -1535,10 +1549,16 @@ server.registerTool('load_session_context', {
   const manifestRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(manifestPath)}`, {
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   })
+  let manifestContent: string
   if (!manifestRes.ok) {
-    return { content: [{ type: "text", text: `❌ Manifest not found at ${manifestPath}` }] }
+    const githubManifest = await readNoteFromGitHub(manifestPath)
+    if (!githubManifest) {
+      return { content: [{ type: "text", text: `❌ Manifest not found at ${manifestPath}` }] }
+    }
+    manifestContent = githubManifest
+  } else {
+    manifestContent = await manifestRes.text()
   }
-  const manifestContent = await manifestRes.text()
 
   function parseManifestSection(content: string, sectionName: string): string[] {
     const lines = content.split('\n')
@@ -1564,8 +1584,14 @@ server.registerTool('load_session_context', {
       const res = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(notePath)}`, {
         headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
       })
-      if (!res.ok) return `\n\n---\n⚠️ Could not load: ${notePath}\n---`
-      const text = await res.text()
+      let text: string
+      if (!res.ok) {
+        const githubText = await readNoteFromGitHub(notePath)
+        if (!githubText) return `\n\n---\n⚠️ Could not load: ${notePath}\n---`
+        text = githubText + '\n*(via GitHub fallback)*'
+      } else {
+        text = await res.text()
+      }
       return `\n\n---\n## ${notePath}\n\n${text}`
     })
   )
@@ -1577,9 +1603,16 @@ server.registerTool('load_session_context', {
       const listRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(folderPath)}/`, {
         headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
       })
-      if (!listRes.ok) return `\n\n---\n## Project Brief: ${proj}\n⚠️ Project folder not found\n---`
-      const data = await listRes.json()
-      const statusFile = (data.files || [])
+      let fileList: string[]
+      if (!listRes.ok) {
+        const githubFiles = await listFolderFromGitHub(`01-projects/${proj}`)
+        if (!githubFiles) return `\n\n---\n## Project Brief: ${proj}\n⚠️ Project folder not found\n---`
+        fileList = githubFiles
+      } else {
+        const data = await listRes.json()
+        fileList = data.files || []
+      }
+      const statusFile = fileList
         .filter((f: string) => f.toLowerCase().includes('status') && f.endsWith('.md'))
         .sort()
         .reverse()[0]
@@ -1588,8 +1621,14 @@ server.registerTool('load_session_context', {
       const noteRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(notePath)}`, {
         headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
       })
-      if (!noteRes.ok) return `\n\n---\n## Project Brief: ${proj}\n❌ Could not read status note\n---`
-      const content = await noteRes.text()
+      let content: string
+      if (!noteRes.ok) {
+        const githubContent = await readNoteFromGitHub(notePath)
+        if (!githubContent) return `\n\n---\n## Project Brief: ${proj}\n❌ Could not read status note\n---`
+        content = githubContent + '\n*(via GitHub fallback)*'
+      } else {
+        content = await noteRes.text()
+      }
       return `\n\n---\n## Project Brief: ${proj}\n📄 ${notePath}\n\n${content}`
     })
   )
