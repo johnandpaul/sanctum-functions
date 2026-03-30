@@ -83,13 +83,15 @@ server.registerTool('save_brainstorm', {
     raw: z.string().optional().describe("Full context or raw notes"),
     project: z.string().optional().describe("Project: sigyls, dallas-tub-fix, or leave empty"),
     tags: z.array(z.string()).optional().describe("Hierarchical tags like sigyls/strategy"),
-    source_chat_url: z.string().optional().describe("URL of the Claude chat where this brainstorm originated")
+    source_chat_url: z.string().optional().describe("URL of the Claude chat where this brainstorm originated"),
+    purpose: z.string().optional().default("NEEDS REVIEW").describe("Purpose or intent of this brainstorm")
   }
-}, async ({ title, summary, insights, actions, raw, project, tags, source_chat_url }) => {
+}, async ({ title, summary, insights, actions, raw, project, tags, source_chat_url, purpose }) => {
   const today = new Date().toISOString().split("T")[0];
   const tagList = tags ? tags.join(", ") : "";
   const note = `---
 type: brainstorm
+purpose: "${purpose}"
 status: active
 tags: [${tagList}]
 created: ${today}
@@ -212,9 +214,10 @@ server.registerTool('save_artifact', {
     project: z.string().optional().describe("Project: sigyls, dallas-tub-fix, sanctum, sono, turnkey, or leave empty for general resources"),
     tags: z.array(z.string()).optional().describe("Hierarchical tags like sigyls/architecture or sigyls/ux-design"),
     artifact_type: z.string().optional().describe("Type of artifact: spec, design, diagram, research, template, other"),
-    source_chat_url: z.string().optional().describe("URL of the Claude chat where this artifact originated")
+    source_chat_url: z.string().optional().describe("URL of the Claude chat where this artifact originated"),
+    purpose: z.string().optional().default("NEEDS REVIEW").describe("Purpose or intent of this artifact")
   }
-}, async ({ title, summary, content, project, tags, artifact_type, source_chat_url }) => {
+}, async ({ title, summary, content, project, tags, artifact_type, source_chat_url, purpose }) => {
   const today = new Date().toISOString().split("T")[0];
   const tagList = tags ? tags.join(", ") : "";
   const folder = project
@@ -223,6 +226,7 @@ server.registerTool('save_artifact', {
 
   const note = `---
 type: resource
+purpose: "${purpose}"
 artifact_type: ${artifact_type || "other"}
 status: active
 tags: [${tagList}]
