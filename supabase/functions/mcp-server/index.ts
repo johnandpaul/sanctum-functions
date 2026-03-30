@@ -209,6 +209,97 @@ async function updateVaultIndexSection(
   });
 }
 
+async function runVaultIndexGeneration(): Promise<{ totalNotes: number; folderCount: number; errors: string[] }> {
+  const folders = [
+    '00-system/', '00-inbox/',
+    '01-projects/sigyls/', '01-projects/dallas-tub-fix/',
+    '01-projects/sanctum/', '01-projects/sono/',
+    '01-projects/turnkey/', '01-projects/iconic-roofing/',
+    '02-areas/', '03-resources/', '04-archive/'
+  ];
+
+  const today = new Date().toISOString().split('T')[0];
+  let index = `# Vault Index\n\nGenerated: ${today}\n`;
+  let totalNotes = 0;
+  const errors: string[] = [];
+
+  for (const folder of folders) {
+    try {
+      const listRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(folder)}`, {
+        headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+      });
+      if (!listRes.ok) continue;
+
+      const listing = await listRes.json();
+      const files: string[] = (listing.files || []).filter((f: string) =>
+        f.endsWith('.md') && f !== 'vault-index.md'
+      );
+
+      if (files.length === 0) {
+        index += `\n## ${folder}\n`;
+        continue;
+      }
+
+      index += `\n## ${folder}\n\n`;
+
+      for (const file of files) {
+        try {
+          const noteRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(folder + file)}`, {
+            headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+          });
+          if (!noteRes.ok) {
+            errors.push(`Failed to read: ${file}`);
+            continue;
+          }
+
+          const content = await noteRes.text();
+          const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
+          let type = 'unknown';
+          let purpose = 'NEEDS REVIEW';
+          let status = 'active';
+          let tagStr = '';
+
+          if (fmMatch) {
+            const fm = fmMatch[1];
+            const getField = (name: string) => {
+              const m = fm.match(new RegExp(`^${name}:\\s*(.+)$`, 'm'));
+              return m ? m[1].replace(/^["']|["']$/g, '').trim() : '';
+            };
+            type = getField('type') || getField('artifact_type') || 'unknown';
+            purpose = getField('purpose') || 'NEEDS REVIEW';
+            status = getField('status') || 'active';
+            const tags = fm.match(/^tags:\s*\[([^\]]*)\]/m);
+            tagStr = tags ? tags[1].replace(/\s/g, '') : '';
+          }
+
+          const filename = file.split('/').pop() || file;
+          index += buildIndexEntry(filename, { type, purpose, status, tags: tagStr }) + '\n';
+          totalNotes++;
+        } catch {
+          errors.push(`Error reading: ${file}`);
+        }
+      }
+    } catch {
+      errors.push(`Error listing folder: ${folder}`);
+    }
+  }
+
+  const writeRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath('00-system/vault-index.md')}`, {
+    method: 'PUT',
+    headers: {
+      "Authorization": `Bearer ${OBSIDIAN_API_KEY}`,
+      "Content-Type": "text/markdown"
+    },
+    body: index
+  });
+
+  if (!writeRes.ok) {
+    throw new Error(`Failed to write vault-index.md (status ${writeRes.status})`);
+  }
+
+  return { totalNotes, folderCount: folders.length, errors };
+}
+
 server.registerTool('save_brainstorm', {
   title: 'Save Brainstorm',
   description: "Save a brainstorm or idea from a Claude chat directly to John's Obsidian vault inbox. Use this when John asks to save, capture, or send something to his vault.",
@@ -1904,100 +1995,29 @@ server.registerTool('generate_vault_index', {
   description: "Scans all notes across the entire vault, reads their frontmatter, and generates a fresh vault-index.md in 00-system/. Groups notes by folder matching the PARA structure. Call this when the INDEX may be stale or after bulk operations.",
   inputSchema: {},
 }, async () => {
-  const folders = [
-    '00-system/', '00-inbox/',
-    '01-projects/sigyls/', '01-projects/dallas-tub-fix/',
-    '01-projects/sanctum/', '01-projects/sono/',
-    '01-projects/turnkey/', '01-projects/iconic-roofing/',
-    '02-areas/', '03-resources/', '04-archive/'
-  ];
-
-  const today = new Date().toISOString().split('T')[0];
-  let index = `# Vault Index\n\nGenerated: ${today}\n`;
-  let totalNotes = 0;
-  const errors: string[] = [];
-
-  for (const folder of folders) {
-    try {
-      // List files in folder
-      const listRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(folder)}`, {
-        headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
-      });
-      if (!listRes.ok) continue;
-
-      const listing = await listRes.json();
-      const files: string[] = (listing.files || []).filter((f: string) =>
-        f.endsWith('.md') && f !== 'vault-index.md'
-      );
-
-      if (files.length === 0) {
-        index += `\n## ${folder}\n`;
-        continue;
-      }
-
-      index += `\n## ${folder}\n\n`;
-
-      for (const file of files) {
-        try {
-          const noteRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(folder + file)}`, {
-            headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
-          });
-          if (!noteRes.ok) {
-            errors.push(`Failed to read: ${file}`);
-            continue;
-          }
-
-          const content = await noteRes.text();
-          const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
-          let type = 'unknown';
-          let purpose = 'NEEDS REVIEW';
-          let status = 'active';
-          let tagStr = '';
-
-          if (fmMatch) {
-            const fm = fmMatch[1];
-            const getField = (name: string) => {
-              const m = fm.match(new RegExp(`^${name}:\\s*(.+)$`, 'm'));
-              return m ? m[1].replace(/^["']|["']$/g, '').trim() : '';
-            };
-            type = getField('type') || getField('artifact_type') || 'unknown';
-            purpose = getField('purpose') || 'NEEDS REVIEW';
-            status = getField('status') || 'active';
-            const tags = fm.match(/^tags:\s*\[([^\]]*)\]/m);
-            tagStr = tags ? tags[1].replace(/\s/g, '') : '';
-          }
-
-          const filename = file.split('/').pop() || file;
-          index += buildIndexEntry(filename, { type, purpose, status, tags: tagStr }) + '\n';
-          totalNotes++;
-        } catch {
-          errors.push(`Error reading: ${file}`);
-        }
-      }
-    } catch {
-      errors.push(`Error listing folder: ${folder}`);
-    }
+  try {
+    const result = await runVaultIndexGeneration();
+    const errorSummary = result.errors.length > 0 ? `\n⚠️ ${result.errors.length} errors:\n${result.errors.join('\n')}` : '';
+    return {
+      content: [{
+        type: "text",
+        text: `✅ Vault INDEX generated: ${result.totalNotes} notes indexed across ${result.folderCount} folders.${errorSummary}`
+      }]
+    };
+  } catch (err) {
+    return {
+      content: [{ type: "text", text: `❌ ${String(err)}` }]
+    };
   }
+});
 
-  // Write the index
-  const writeRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath('00-system/vault-index.md')}`, {
-    method: 'PUT',
-    headers: {
-      "Authorization": `Bearer ${OBSIDIAN_API_KEY}`,
-      "Content-Type": "text/markdown"
-    },
-    body: index
-  });
-
-  const errorSummary = errors.length > 0 ? `\n⚠️ ${errors.length} errors:\n${errors.join('\n')}` : '';
-  return {
-    content: [{
-      type: "text",
-      text: writeRes.ok
-        ? `✅ Vault INDEX generated: ${totalNotes} notes indexed across ${folders.length} folders.${errorSummary}`
-        : `❌ Failed to write vault-index.md (status ${writeRes.status})${errorSummary}`
-    }]
-  };
+app.get('/cron/generate-index', async (c) => {
+  try {
+    const result = await runVaultIndexGeneration();
+    return c.json({ ok: true, notes: result.totalNotes, folders: result.folderCount, errors: result.errors });
+  } catch (err) {
+    return c.json({ ok: false, error: String(err) }, 500);
+  }
 });
 
 app.all('*', async (c) => {
