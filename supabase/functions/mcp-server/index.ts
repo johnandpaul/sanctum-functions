@@ -2,7 +2,7 @@ import 'jsr:@supabase/functions-js/edge-runtime.d.ts'
 import { McpServer } from 'npm:@modelcontextprotocol/sdk@1.25.3/server/mcp.js'
 import { WebStandardStreamableHTTPServerTransport } from 'npm:@modelcontextprotocol/sdk@1.25.3/server/webStandardStreamableHttp.js'
 import { Hono } from 'npm:hono@^4.9.7'
-import { z } from 'npm:zod@^4.1.13'
+import { z } from 'npm:zod@^4.3.6'
 import { createClient } from 'npm:@supabase/supabase-js@2'
 
 const OBSIDIAN_API_URL = Deno.env.get("OBSIDIAN_API_URL")!;
@@ -72,6 +72,143 @@ async function getAllVaultNotes(folderPath = ''): Promise<string[]> {
   return allNotes
 }
 
+function buildIndexEntry(filename: string, meta: { type?: string; purpose?: string; status?: string; tags?: string }): string {
+  const t = meta.type || 'unknown';
+  const p = meta.purpose || 'NEEDS REVIEW';
+  const s = meta.status || 'active';
+  const tg = meta.tags || '';
+  return `[${t}] ${filename}\n  purpose: "${p}"\n  tags: ${tg}\n  status: ${s}`;
+}
+
+async function updateVaultIndex(
+  operation: 'add' | 'update' | 'remove',
+  folder: string,
+  filename: string,
+  meta?: { type?: string; purpose?: string; status?: string; tags?: string }
+): Promise<void> {
+  const indexPath = '00-system/vault-index.md';
+  let content = '';
+
+  // Try to read existing index
+  try {
+    const res = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(indexPath)}`, {
+      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+    });
+    if (res.ok) {
+      content = await res.text();
+    }
+  } catch {
+    // Index doesn't exist yet, start fresh
+  }
+
+  if (!content) {
+    const today = new Date().toISOString().split('T')[0];
+    content = `# Vault Index\n\nGenerated: ${today}\n`;
+  }
+
+  const sectionHeader = `## ${folder}`;
+  const entry = meta ? buildIndexEntry(filename, meta) : '';
+
+  if (operation === 'remove' || operation === 'update') {
+    // Remove existing entry for this filename in the folder section
+    const sectionRegex = new RegExp(`(## ${folder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n)([\\s\\S]*?)(?=\\n## |$)`);
+    const sectionMatch = content.match(sectionRegex);
+    if (sectionMatch) {
+      const sectionContent = sectionMatch[2];
+      // Remove the entry block: [type] filename.md followed by indented lines
+      const entryRegex = new RegExp(`\\[\\w+\\] ${filename.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n(?:  [^\\n]*\\n?)*`, 'g');
+      const cleaned = sectionContent.replace(entryRegex, '');
+      content = content.replace(sectionMatch[0], sectionMatch[1] + cleaned);
+    }
+  }
+
+  if (operation === 'add' || operation === 'update') {
+    if (!content.includes(sectionHeader)) {
+      // Append new section
+      content = content.trimEnd() + `\n\n${sectionHeader}\n\n${entry}\n`;
+    } else {
+      // Add entry at end of existing section
+      const sectionRegex = new RegExp(`(## ${folder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n)`);
+      const sectionMatch = content.match(sectionRegex);
+      if (sectionMatch && sectionMatch.index !== undefined) {
+        // Find end of section (next ## or end of file)
+        const afterSection = content.substring(sectionMatch.index + sectionMatch[0].length);
+        const nextSectionIdx = afterSection.search(/\n## /);
+        const insertPos = nextSectionIdx === -1
+          ? content.length
+          : sectionMatch.index + sectionMatch[0].length + nextSectionIdx;
+        content = content.substring(0, insertPos).trimEnd() + `\n${entry}\n` + content.substring(insertPos);
+      }
+    }
+  }
+
+  // Write updated index
+  await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(indexPath)}`, {
+    method: 'PUT',
+    headers: {
+      "Authorization": `Bearer ${OBSIDIAN_API_KEY}`,
+      "Content-Type": "text/markdown"
+    },
+    body: content
+  });
+}
+
+async function updateVaultIndexSection(
+  operation: 'create' | 'remove' | 'rename',
+  folderPath: string,
+  newFolderPath?: string
+): Promise<void> {
+  const indexPath = '00-system/vault-index.md';
+  let content = '';
+
+  // Try to read existing index
+  try {
+    const res = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(indexPath)}`, {
+      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+    });
+    if (res.ok) {
+      content = await res.text();
+    }
+  } catch {
+    // Index doesn't exist yet, start fresh
+  }
+
+  if (!content) {
+    const today = new Date().toISOString().split('T')[0];
+    content = `# Vault Index\n\nGenerated: ${today}\n`;
+  }
+
+  const sectionHeader = `## ${folderPath}`;
+  const escapedFolder = folderPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  if (operation === 'remove') {
+    // Remove the entire section header and all its content
+    const sectionRegex = new RegExp(`\\n?## ${escapedFolder}\\n[\\s\\S]*?(?=\\n## |$)`);
+    content = content.replace(sectionRegex, '');
+  }
+
+  if (operation === 'rename' && newFolderPath) {
+    // Replace the section header with the new folder path
+    content = content.replace(`## ${folderPath}`, `## ${newFolderPath}`);
+  }
+
+  if (operation === 'create') {
+    if (!content.includes(sectionHeader)) {
+      content = content.trimEnd() + `\n\n${sectionHeader}\n`;
+    }
+  }
+
+  // Write updated index
+  await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(indexPath)}`, {
+    method: 'PUT',
+    headers: {
+      "Authorization": `Bearer ${OBSIDIAN_API_KEY}`,
+      "Content-Type": "text/markdown"
+    },
+    body: content
+  });
+}
+
 server.registerTool('save_brainstorm', {
   title: 'Save Brainstorm',
   description: "Save a brainstorm or idea from a Claude chat directly to John's Obsidian vault inbox. Use this when John asks to save, capture, or send something to his vault.",
@@ -135,6 +272,7 @@ ${raw || ""}
   headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SUPABASE_ANON_KEY}` },
       body: JSON.stringify({ path: fileName, content: note, project: project || '' })
     })
+    updateVaultIndex('add', fileName.substring(0, fileName.lastIndexOf('/') + 1), fileName.split('/').pop() || '', { type: 'brainstorm', purpose, status: 'active', tags: tagList }).catch(() => {});
   }
 
   return {
@@ -266,6 +404,7 @@ ${content}
   headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SUPABASE_ANON_KEY}` },
       body: JSON.stringify({ path: fileName, content: note, project: project || '' })
     })
+    updateVaultIndex('add', fileName.substring(0, fileName.lastIndexOf('/') + 1), fileName.split('/').pop() || '', { type: 'resource', purpose, status: 'active', tags: tagList }).catch(() => {});
   }
 
   return {
@@ -307,6 +446,11 @@ server.registerTool('delete_note', {
     method: "DELETE",
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   });
+  if (response.ok) {
+    const delFilename = path.split('/').pop() || '';
+    const delFolder = path.substring(0, path.lastIndexOf('/') + 1);
+    updateVaultIndex('remove', delFolder, delFilename).catch(() => {});
+  }
   return {
     content: [{ type: "text", text: response.ok ? `🗑️ Deleted: ${path}` : `❌ Failed to delete: ${path} (status ${response.status})` }]
   };
@@ -367,6 +511,36 @@ server.registerTool('edit_note', {
   headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SUPABASE_ANON_KEY}` },
       body: JSON.stringify({ path, content: noteContent, project: '' })
     })
+    if (mode === 'frontmatter') {
+      try {
+        const editedRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(path)}`, {
+          headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+        });
+        if (editedRes.ok) {
+          const editedContent = await editedRes.text();
+          const fmMatch = editedContent.match(/^---\n([\s\S]*?)\n---/);
+          if (fmMatch) {
+            const fm = fmMatch[1];
+            const getField = (name: string) => {
+              const m = fm.match(new RegExp(`^${name}:\\s*(.+)$`, 'm'));
+              return m ? m[1].replace(/^["']|["']$/g, '').trim() : '';
+            };
+            const editFilename = path.split('/').pop() || '';
+            const editFolder = path.substring(0, path.lastIndexOf('/') + 1);
+            const tags = fm.match(/^tags:\s*\[([^\]]*)\]/m);
+            const tagStr = tags ? tags[1].replace(/\s/g, '') : '';
+            updateVaultIndex('update', editFolder, editFilename, {
+              type: getField('type') || getField('artifact_type'),
+              purpose: getField('purpose'),
+              status: getField('status'),
+              tags: tagStr
+            }).catch(() => {});
+          }
+        }
+      } catch {
+        // INDEX update failed silently
+      }
+    }
   }
 
   return {
@@ -600,6 +774,13 @@ server.registerTool('move_note', {
     console.warn(`⚠️ Embeddings path update failed for move ${source_path} → ${destination_path}:`, embeddingError.message);
   }
 
+  const srcFilename = source_path.split('/').pop() || '';
+  const srcFolder = source_path.substring(0, source_path.lastIndexOf('/') + 1);
+  const destFilename = destination_path.split('/').pop() || '';
+  const destFolder = destination_path.substring(0, destination_path.lastIndexOf('/') + 1);
+  updateVaultIndex('remove', srcFolder, srcFilename).catch(() => {});
+  updateVaultIndex('add', destFolder, destFilename, { type: 'unknown', purpose: 'NEEDS REVIEW', status: 'active', tags: '' }).catch(() => {});
+
   return {
     content: [{ type: "text", text: deleteResponse.ok
       ? `✅ Moved: ${source_path} → ${destination_path}`
@@ -644,6 +825,11 @@ server.registerTool('rename_note', {
     console.warn(`⚠️ Embeddings path update failed for rename ${path} → ${new_path}:`, embeddingError.message);
   }
 
+  const oldFilename = path.split('/').pop() || '';
+  const noteFolder = path.substring(0, path.lastIndexOf('/') + 1);
+  updateVaultIndex('remove', noteFolder, oldFilename).catch(() => {});
+  updateVaultIndex('add', noteFolder, new_name, { type: 'unknown', purpose: 'NEEDS REVIEW', status: 'active', tags: '' }).catch(() => {});
+
   return {
     content: [{ type: "text", text: deleteResponse.ok
       ? `✅ Renamed to: ${new_path}`
@@ -678,6 +864,37 @@ server.registerTool('batch_update_frontmatter', {
       body: noteContent,
     });
     results.push(writeResponse.ok ? `✅ Updated: ${notePath}` : `❌ Failed to write: ${notePath}`);
+  }
+  // Update INDEX for each affected note
+  for (const notePath of paths) {
+    try {
+      const batchRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(notePath)}`, {
+        headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+      });
+      if (batchRes.ok) {
+        const batchContent = await batchRes.text();
+        const fmMatch = batchContent.match(/^---\n([\s\S]*?)\n---/);
+        if (fmMatch) {
+          const fm = fmMatch[1];
+          const getField = (name: string) => {
+            const m = fm.match(new RegExp(`^${name}:\\s*(.+)$`, 'm'));
+            return m ? m[1].replace(/^["']|["']$/g, '').trim() : '';
+          };
+          const batchFilename = notePath.split('/').pop() || '';
+          const batchFolder = notePath.substring(0, notePath.lastIndexOf('/') + 1);
+          const tags = fm.match(/^tags:\s*\[([^\]]*)\]/m);
+          const tagStr = tags ? tags[1].replace(/\s/g, '') : '';
+          updateVaultIndex('update', batchFolder, batchFilename, {
+            type: getField('type') || getField('artifact_type'),
+            purpose: getField('purpose'),
+            status: getField('status'),
+            tags: tagStr
+          }).catch(() => {});
+        }
+      }
+    } catch {
+      // INDEX update failed silently for this note
+    }
   }
   return { content: [{ type: "text", text: results.join("\n") }] };
 })
@@ -743,6 +960,9 @@ server.registerTool('create_folder', {
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}`, "Content-Type": "text/markdown" },
     body: "",
   })
+  if (response.ok) {
+    updateVaultIndexSection('create', folder_path.endsWith('/') ? folder_path : folder_path + '/').catch(() => {});
+  }
   return {
     content: [{ type: "text", text: response.ok
       ? `✅ Created folder: ${cleanPath}`
@@ -782,6 +1002,7 @@ server.registerTool('delete_folder', {
     results.push(delResponse.ok ? `✅ Deleted: ${file}` : `❌ Failed to delete: ${file}`)
   }
   const summary = results.length > 0 ? results.join('\n') + '\n' : ''
+  updateVaultIndexSection('remove', folder_path.endsWith('/') ? folder_path : folder_path + '/').catch(() => {});
   return {
     content: [{ type: "text", text: `${summary}🗑️ ${results.length} file${results.length !== 1 ? 's' : ''} deleted from ${cleanPath}\nNote: empty folder may remain on disk — the API cannot delete folders directly.` }]
   }
@@ -826,6 +1047,10 @@ server.registerTool('rename_folder', {
     results.push(delResponse.ok ? `✅ ${file}` : `⚠️ Copied but failed to delete: ${file}`)
   }
   const summary = results.length > 0 ? '\n' + results.join('\n') : ' (empty folder)'
+  const oldFolderSection = folder_path.endsWith('/') ? folder_path : folder_path + '/';
+  const parentDir = folder_path.substring(0, folder_path.lastIndexOf('/') + 1);
+  const newFolderSection = parentDir + new_name + '/';
+  updateVaultIndexSection('rename', oldFolderSection, newFolderSection).catch(() => {});
   return {
     content: [{ type: "text", text: `✅ Renamed: ${cleanPath} → ${newPath}\nMoved ${files.length} file${files.length !== 1 ? 's' : ''}${summary}` }]
   }
@@ -869,6 +1094,9 @@ server.registerTool('move_folder', {
     results.push(delResponse.ok ? `✅ ${file}` : `⚠️ Copied but failed to delete: ${file}`)
   }
   const summary = results.length > 0 ? '\n' + results.join('\n') : ' (empty folder)'
+  const oldMoveSection = source_path.endsWith('/') ? source_path : source_path + '/';
+  const newMoveSection = destination_path.endsWith('/') ? destination_path : destination_path + '/';
+  updateVaultIndexSection('rename', oldMoveSection, newMoveSection).catch(() => {});
   return {
     content: [{ type: "text", text: `✅ Moved: ${cleanSource} → ${cleanDest}\nMoved ${files.length} file${files.length !== 1 ? 's' : ''}${summary}` }]
   }
@@ -1103,6 +1331,9 @@ server.registerTool('update_project_status', {
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}`, "Content-Type": "text/markdown" },
     body: content,
   })
+  if (writeRes.ok) {
+    updateVaultIndex('update', `01-projects/${project}/`, 'status.md', { type: 'status', purpose: 'Current project status and next steps', status: 'active', tags: `${project}/status` }).catch(() => {});
+  }
   return {
     content: [{ type: "text", text: writeRes.ok
       ? `✅ Status updated: ${targetPath}`
@@ -1210,6 +1441,9 @@ ${personalLines.length ? personalLines.join('\n') : '(none)'}
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}`, "Content-Type": "text/markdown" },
     body: note,
   })
+  if (writeRes.ok) {
+    updateVaultIndex('add', '00-inbox/', `${today}-daily-tasks.md`, { type: 'task-note', purpose: 'Daily task list', status: 'active', tags: 'tasks/daily' }).catch(() => {});
+  }
 
   return {
     content: [{
@@ -1272,6 +1506,11 @@ server.registerTool('archive_task_note', {
   })
 
   const completed = (noteContent.match(/^- \[x\]/gim) || []).length
+
+  const archiveSrcFilename = sourcePath.split('/').pop() || '';
+  const archiveSrcFolder = sourcePath.substring(0, sourcePath.lastIndexOf('/') + 1);
+  updateVaultIndex('remove', archiveSrcFolder, archiveSrcFilename).catch(() => {});
+  updateVaultIndex('add', '04-archive/tasks/', archiveSrcFilename, { type: 'task-note', purpose: 'Archived daily task note', status: 'archived', tags: '' }).catch(() => {});
 
   return {
     content: [{
@@ -1643,6 +1882,123 @@ server.registerTool('load_session_context', {
 
   return { content: [{ type: "text", text: fullContext }] }
 })
+
+server.registerTool('debug_folder_list', {
+  title: 'Debug Folder List',
+  description: "Debug: lists raw folder contents from Obsidian API",
+  inputSchema: {
+    folder: z.string().describe("Folder path to list"),
+  },
+}, async ({ folder }) => {
+  const listRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(folder)}`, {
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  });
+  const raw = await listRes.text();
+  return {
+    content: [{ type: "text", text: `Status: ${listRes.status}\nRaw response:\n${raw}` }]
+  };
+});
+
+server.registerTool('generate_vault_index', {
+  title: 'Generate Vault Index',
+  description: "Scans all notes across the entire vault, reads their frontmatter, and generates a fresh vault-index.md in 00-system/. Groups notes by folder matching the PARA structure. Call this when the INDEX may be stale or after bulk operations.",
+  inputSchema: {},
+}, async () => {
+  const folders = [
+    '00-system/', '00-inbox/',
+    '01-projects/sigyls/', '01-projects/dallas-tub-fix/',
+    '01-projects/sanctum/', '01-projects/sono/',
+    '01-projects/turnkey/', '01-projects/iconic-roofing/',
+    '02-areas/', '03-resources/', '04-archive/'
+  ];
+
+  const today = new Date().toISOString().split('T')[0];
+  let index = `# Vault Index\n\nGenerated: ${today}\n`;
+  let totalNotes = 0;
+  const errors: string[] = [];
+
+  for (const folder of folders) {
+    try {
+      // List files in folder
+      const listRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(folder)}`, {
+        headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+      });
+      if (!listRes.ok) continue;
+
+      const listing = await listRes.json();
+      const files: string[] = (listing.files || []).filter((f: string) =>
+        f.endsWith('.md') && f !== 'vault-index.md'
+      );
+
+      if (files.length === 0) {
+        index += `\n## ${folder}\n`;
+        continue;
+      }
+
+      index += `\n## ${folder}\n\n`;
+
+      for (const file of files) {
+        try {
+          const noteRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(folder + file)}`, {
+            headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+          });
+          if (!noteRes.ok) {
+            errors.push(`Failed to read: ${file}`);
+            continue;
+          }
+
+          const content = await noteRes.text();
+          const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
+          let type = 'unknown';
+          let purpose = 'NEEDS REVIEW';
+          let status = 'active';
+          let tagStr = '';
+
+          if (fmMatch) {
+            const fm = fmMatch[1];
+            const getField = (name: string) => {
+              const m = fm.match(new RegExp(`^${name}:\\s*(.+)$`, 'm'));
+              return m ? m[1].replace(/^["']|["']$/g, '').trim() : '';
+            };
+            type = getField('type') || getField('artifact_type') || 'unknown';
+            purpose = getField('purpose') || 'NEEDS REVIEW';
+            status = getField('status') || 'active';
+            const tags = fm.match(/^tags:\s*\[([^\]]*)\]/m);
+            tagStr = tags ? tags[1].replace(/\s/g, '') : '';
+          }
+
+          const filename = file.split('/').pop() || file;
+          index += buildIndexEntry(filename, { type, purpose, status, tags: tagStr }) + '\n';
+          totalNotes++;
+        } catch {
+          errors.push(`Error reading: ${file}`);
+        }
+      }
+    } catch {
+      errors.push(`Error listing folder: ${folder}`);
+    }
+  }
+
+  // Write the index
+  const writeRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath('00-system/vault-index.md')}`, {
+    method: 'PUT',
+    headers: {
+      "Authorization": `Bearer ${OBSIDIAN_API_KEY}`,
+      "Content-Type": "text/markdown"
+    },
+    body: index
+  });
+
+  const errorSummary = errors.length > 0 ? `\n⚠️ ${errors.length} errors:\n${errors.join('\n')}` : '';
+  return {
+    content: [{
+      type: "text",
+      text: writeRes.ok
+        ? `✅ Vault INDEX generated: ${totalNotes} notes indexed across ${folders.length} folders.${errorSummary}`
+        : `❌ Failed to write vault-index.md (status ${writeRes.status})${errorSummary}`
+    }]
+  };
+});
 
 app.all('*', async (c) => {
   const transport = new WebStandardStreamableHTTPServerTransport()
