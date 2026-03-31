@@ -1879,7 +1879,7 @@ server.registerTool('load_session_context', {
     project: z.string().optional().describe("Optional project name for deep-loading: sigyls, turnkey, dallas-tub-fix, sanctum, sono")
   }
 }, async ({ project }) => {
-  const manifestPath = '01-projects/sanctum/2026-03-26-context-manifest.md'
+  const manifestPath = '00-system/context-manifest.md'
   const manifestRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(manifestPath)}`, {
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
   })
