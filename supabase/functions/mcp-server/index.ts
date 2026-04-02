@@ -324,7 +324,7 @@ status: active
 tags: [${tagList}]
 created: ${today}
 source: claude-chat
-project: ${project || ""}
+project: ${(project || "general").trim()}
 source_chat_url: "${source_chat_url || ""}"
 edit_history:
   - date: ${today}
@@ -461,7 +461,7 @@ status: active
 tags: [${tagList}]
 created: ${today}
 source: claude-chat
-project: ${project || ""}
+project: ${(project || "general").trim()}
 source_chat_url: "${source_chat_url || ""}"
 edit_history:
   - date: ${today}
