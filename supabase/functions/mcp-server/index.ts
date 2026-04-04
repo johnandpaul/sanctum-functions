@@ -444,9 +444,10 @@ server.registerTool('save_artifact', {
     tags: z.array(z.string()).optional().describe("Hierarchical tags like sigyls/architecture or sigyls/ux-design"),
     artifact_type: z.string().optional().describe("Type of artifact: spec, design, diagram, research, template, other"),
     source_chat_url: z.string().optional().describe("URL of the Claude chat where this artifact originated"),
+    date_prefix: z.boolean().optional().default(true).describe("Whether to prepend today's date to the filename. Default true. Set false for Foundry spec files."),
     purpose: z.string().optional().default("NEEDS REVIEW").describe("Purpose or intent of this artifact")
   }
-}, async ({ title, summary, content, project, tags, artifact_type, source_chat_url, purpose }) => {
+}, async ({ title, summary, content, project, tags, artifact_type, source_chat_url, date_prefix, purpose }) => {
   const today = new Date().toISOString().split("T")[0];
   const tagList = tags ? tags.join(", ") : "";
   const folder = project
@@ -480,7 +481,8 @@ ${content}
 ## Related
 `;
 
-  const fileName = `${folder}/${today}-${title.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "")}.md`;
+  const slug = title.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
+  const fileName = date_prefix !== false ? `${folder}/${today}-${slug}.md` : `${folder}/${slug}.md`;
   const response = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(fileName)}`, {
     method: "PUT",
     headers: {
