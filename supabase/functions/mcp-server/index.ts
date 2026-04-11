@@ -10,6 +10,7 @@ const OBSIDIAN_API_KEY = Deno.env.get("OBSIDIAN_API_KEY")!;
 const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
 const SUPADATA_API_KEY = Deno.env.get("GET_YOUTUBE_TRANSCRIPTS")!;
 const GITHUB_TOKEN = Deno.env.get("GITHUB_TOKEN")!;
 const GITHUB_REPO = "johnandpaul/vault";
@@ -45,6 +46,115 @@ async function listFolderFromGitHub(folderPath: string): Promise<string[] | null
 
 function encodedVaultPath(path: string): string {
   return path.split('/').map((s: string) => s ? encodeURIComponent(s) : s).join('/');
+}
+
+// ─── Query Intent Router helpers (Component 20) ─────────────────────────────
+
+async function callHaiku(prompt: string, maxTokens = 512): Promise<string> {
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: maxTokens,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  })
+  if (!res.ok) throw new Error(`Haiku API ${res.status}`)
+  const data = await res.json()
+  return data.content[0].text
+}
+
+type QueryType =
+  | 'factual_recall'
+  | 'decision_history'
+  | 'current_status'
+  | 'entity_lookup'
+  | 'exploratory_synthesis'
+  | 'cross_project'
+  | 'approach_recommendation'
+
+interface QueryClassification {
+  query_type: QueryType
+  topic: string
+  project: string | null
+  confidence: number
+  classifier_error?: string
+}
+
+async function classifyQueryIntent(query: string): Promise<QueryClassification> {
+  const prompt = `You are a query intent classifier for John's knowledge vault.
+
+Classify the query into exactly ONE of these types:
+
+- factual_recall: find specific notes or facts. "what did I save about X", "find notes on Y"
+- decision_history: history of decisions on a topic. "what did I decide about X", "how has my thinking on Y evolved"
+- current_status: current state of something. "what's the status of project X", "what's active right now"
+- entity_lookup: info about a person, company, technology, or concept. "who is X", "tell me about technology Y"
+- exploratory_synthesis: narrative across many notes. "tell me everything about X", "synthesize my thinking on Y"
+- cross_project: connections across multiple projects. "what do Sono and Sigyls have in common"
+- approach_recommendation: advice on how to proceed. "how should I approach X", "what should I try for Y"
+
+Also extract:
+- topic: the main subject (2-5 words, lowercase)
+- project: if a specific project is named (sigyls, sono, sanctum, dtf, turnkey, iconic-roofing), else null
+
+Return ONLY valid JSON, no prose, no code fences:
+{"query_type":"...","topic":"...","project":null_or_string,"confidence":0.0}
+
+Query: ${JSON.stringify(query)}`
+
+  try {
+    const raw = await callHaiku(prompt, 256)
+    const cleaned = raw.trim().replace(/^```(?:json)?\s*/, '').replace(/\s*```$/, '')
+    const parsed = JSON.parse(cleaned)
+    const validTypes: QueryType[] = [
+      'factual_recall', 'decision_history', 'current_status', 'entity_lookup',
+      'exploratory_synthesis', 'cross_project', 'approach_recommendation'
+    ]
+    if (!validTypes.includes(parsed.query_type)) {
+      return {
+        query_type: 'factual_recall',
+        topic: query,
+        project: null,
+        confidence: 0.3,
+        classifier_error: `invalid query_type: ${parsed.query_type}`,
+      }
+    }
+    return {
+      query_type: parsed.query_type,
+      topic: (parsed.topic ?? query).toString(),
+      project: parsed.project ?? null,
+      confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0.5,
+    }
+  } catch (err) {
+    return {
+      query_type: 'factual_recall',
+      topic: query,
+      project: null,
+      confidence: 0.3,
+      classifier_error: `classifier failure: ${(err as Error).message}`,
+    }
+  }
+}
+
+async function internalSemanticSearch(
+  query: string,
+  limit = 5,
+  project: string | null = null
+): Promise<Array<{ path: string; similarity: number; content: string }>> {
+  const res = await fetch('https://ozezxrmaoukpqjshimys.supabase.co/functions/v1/semantic-search', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query, limit, project }),
+  })
+  if (!res.ok) return []
+  const data = await res.json()
+  return (data.results ?? []) as Array<{ path: string; similarity: number; content: string }>
 }
 
 const app = new Hono()
@@ -378,7 +488,7 @@ ${raw || ""}
 
 server.registerTool('search_vault', {
   title: 'Search Vault',
-  description: "Search John's Obsidian vault for notes related to a topic.",
+  description: "Exact keyword/substring search across John's Obsidian vault (literal string match only). ⚠️ For natural language questions, use route_query instead — it picks the right retrieval strategy automatically. Only use search_vault when you need to find notes containing a specific exact term, filename fragment, or literal phrase (e.g. finding every note that mentions a specific function name or error string).",
   inputSchema: { query: z.string().describe("Search term or topic") }
 }, async ({ query }) => {
   const response = await fetch(
@@ -517,7 +627,7 @@ ${content}
 
 server.registerTool('semantic_search', {
   title: 'Semantic Search',
-  description: "Search John's Obsidian vault by meaning rather than keywords. Finds notes that are conceptually related to the query even if they don't contain the exact words.",
+  description: "Low-level semantic similarity search over John's vault by meaning rather than keywords. ⚠️ For natural language questions, use route_query instead — it classifies intent and picks the best retrieval strategy (semantic_search is just one of several it can choose). Only use semantic_search directly when you explicitly want raw vector similarity results without intent classification or routing.",
   inputSchema: {
     query: z.string().describe("The concept or question to search for"),
     limit: z.number().optional().describe("Number of results to return, default 5"),
@@ -2001,6 +2111,178 @@ server.registerTool('debug_folder_list', {
     content: [{ type: "text", text: `Status: ${listRes.status}\nRaw response:\n${raw}` }]
   };
 });
+
+server.registerTool('route_query', {
+  title: 'Route Query (Smart Search)',
+  description: "PREFERRED TOOL for any natural language question about John's vault. Always try this FIRST for questions like 'what did I decide about X', 'how should I approach Y', 'what's the status of Z', 'what do I know about...', or any conceptual/exploratory query. Classifies query intent using Haiku, then automatically routes to the optimal retrieval strategy (semantic search, decision history, entity lookup, current status, synthesis, or cross-project insight). Includes dead-end memory check for 'how should I approach X' questions. Only fall back to search_vault or semantic_search if route_query returns no useful results.",
+  inputSchema: {
+    query: z.string().describe("The user's question or search query in natural language"),
+  },
+}, async ({ query }) => {
+  const classification = await classifyQueryIntent(query)
+  const { query_type, topic, project, confidence, classifier_error } = classification
+
+  const headerLines = [
+    `🎯 Query: ${JSON.stringify(query)}`,
+    `📋 Classified as: ${query_type} (confidence ${confidence.toFixed(2)})`,
+    `   topic: ${topic}${project ? ` | project: ${project}` : ''}`,
+  ]
+  if (classifier_error) headerLines.push(`   ⚠️ ${classifier_error} — defaulted to factual_recall`)
+  if (confidence < 0.5 && !classifier_error) headerLines.push(`   ⚠️ low confidence classification`)
+  const header = headerLines.join('\n') + '\n\n'
+
+  // ─── Dead-end memory check (Component 32) for approach_recommendation ─────
+  let deadEndNotice = ''
+  if (query_type === 'approach_recommendation') {
+    const { data: sessionRows } = await supabase
+      .from('session_log')
+      .select('session_date, abandoned_approaches')
+      .order('session_date', { ascending: false })
+      .limit(200)
+    const hits: string[] = []
+    for (const row of sessionRows ?? []) {
+      const approaches = Array.isArray(row.abandoned_approaches) ? row.abandoned_approaches : []
+      for (const a of approaches) {
+        const hay = `${a.approach ?? ''} ${a.reason_failed ?? ''} ${a.project ?? ''}`.toLowerCase()
+        if (hay.includes(topic.toLowerCase()) || (project && a.project === project)) {
+          hits.push(`⚠️ Previously abandoned (${row.session_date}): ${a.approach}\n   Reason: ${a.reason_failed}`)
+        }
+      }
+    }
+    deadEndNotice = hits.length
+      ? `## Dead-end memory\n${hits.join('\n')}\n\n`
+      : `## Dead-end memory\n(no prior abandoned approaches found for this topic)\n\n`
+  }
+
+  // ─── Route execution ───────────────────────────────────────────────────────
+  let body = ''
+
+  switch (query_type) {
+    case 'factual_recall':
+    case 'exploratory_synthesis':
+    case 'approach_recommendation': {
+      const results = await internalSemanticSearch(topic || query, 5, project)
+      if (!results.length) {
+        body = `No semantic search results for: ${topic || query}`
+        break
+      }
+      const label = query_type === 'exploratory_synthesis'
+        ? '## Relevant notes (full synthesis coming in Phase 4 via synthesize_thinking_on)'
+        : '## Relevant notes'
+      body = `${label}\n` + results.map(r =>
+        `📄 ${r.path} (${Math.round(r.similarity * 100)}% match)\n${r.content.slice(0, 200)}...`
+      ).join('\n\n')
+      break
+    }
+
+    case 'decision_history': {
+      body = `⚠️ get_decision_history() not yet built (Phase 3 C13 pending).\n   Falling back to semantic search.\n\n`
+      const results = await internalSemanticSearch(topic || query, 5, project)
+      body += results.length
+        ? results.map(r => `📄 ${r.path} (${Math.round(r.similarity * 100)}% match)\n${r.content.slice(0, 200)}...`).join('\n\n')
+        : `(no results)`
+      break
+    }
+
+    case 'current_status': {
+      const { data: hotRows, error: hotErr } = await supabase
+        .from('hot_context')
+        .select('context_type, project, content, relevance_score, expires_at')
+        .or(project ? `project.eq.${project},project.is.null` : 'project.is.null')
+        .order('relevance_score', { ascending: false })
+        .limit(10)
+
+      if (!hotErr && hotRows && hotRows.length > 0) {
+        body = `## Hot context${project ? ` — ${project}` : ''}\n` +
+          hotRows.map(r => `[${r.context_type}] ${r.content}`).join('\n')
+      } else if (project) {
+        // Fall back to get_project_brief logic when hot_context is empty and a project is named
+        const folderPath = `01-projects/${project}`
+        const listRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(folderPath)}/`, {
+          headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+        })
+        if (!listRes.ok) {
+          body = `ℹ️ hot_context empty, showing project brief instead\n❌ Project folder not found: ${folderPath}`
+        } else {
+          const folderData = await listRes.json()
+          const statusFile = (folderData.files || [])
+            .filter((f: string) => f.toLowerCase().includes('status') && f.endsWith('.md'))
+            .sort()
+            .reverse()[0]
+          if (!statusFile) {
+            body = `ℹ️ hot_context empty, showing project brief instead\nℹ️ No status note found for project: ${project}`
+          } else {
+            const notePath = `${folderPath}/${statusFile}`
+            const noteRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(notePath)}`, {
+              headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+            })
+            if (!noteRes.ok) {
+              body = `ℹ️ hot_context empty, showing project brief instead\n❌ Could not read status note: ${notePath}`
+            } else {
+              const briefContent = await noteRes.text()
+              body = `ℹ️ hot_context empty, showing project brief instead\n\n# Project Brief: ${project}\n📄 ${notePath}\n\n${briefContent}`
+            }
+          }
+        }
+      } else {
+        body = `No hot_context entries and no project specified.\n(load_session_context upgrade coming in Phase 3 C11.)`
+      }
+      break
+    }
+
+    case 'entity_lookup': {
+      const { data: byName } = await supabase
+        .from('entities')
+        .select('id, name, entity_type, description, mention_count, aliases')
+        .ilike('name', `%${topic}%`)
+        .limit(5)
+      const { data: byAlias } = await supabase
+        .from('entities')
+        .select('id, name, entity_type, description, mention_count, aliases')
+        .contains('aliases', [topic])
+        .limit(5)
+
+      const merged = new Map<string, { id: string; name: string; entity_type: string; description: string | null; mention_count: number | null; aliases: string[] | null }>()
+      for (const e of [...(byName ?? []), ...(byAlias ?? [])]) {
+        merged.set(e.id, e)
+      }
+      const entityRows = Array.from(merged.values())
+        .sort((a, b) => (b.mention_count ?? 0) - (a.mention_count ?? 0))
+        .slice(0, 5)
+
+      if (!entityRows.length) {
+        body = `No entities matching "${topic}" (searched name and aliases).`
+        break
+      }
+      body = `## Entity matches\n` + entityRows.map(e => {
+        const aliasLine = e.aliases?.length ? ` (aka ${e.aliases.join(', ')})` : ''
+        const descLine = e.description ? `\n  ${e.description}` : ''
+        const mentionLine = e.mention_count ? `\n  ${e.mention_count} mention(s)` : ''
+        return `🔹 ${e.name} [${e.entity_type}]${aliasLine}${descLine}${mentionLine}`
+      }).join('\n\n')
+      break
+    }
+
+    case 'cross_project': {
+      body = `⚠️ cross_project_insight() is a Phase 4 tool (not yet built).\n   Falling back to cross-project semantic search.\n\n`
+      const results = await internalSemanticSearch(topic || query, 8, null)
+      const byProject = new Map<string, typeof results>()
+      for (const r of results) {
+        const proj = r.path.split('/')[1] ?? 'other'
+        if (!byProject.has(proj)) byProject.set(proj, [])
+        byProject.get(proj)!.push(r)
+      }
+      body += Array.from(byProject.entries())
+        .map(([proj, rows]) => `### ${proj}\n` + rows.map(r =>
+          `📄 ${r.path} (${Math.round(r.similarity * 100)}%)`
+        ).join('\n'))
+        .join('\n\n')
+      break
+    }
+  }
+
+  return { content: [{ type: 'text', text: `${header}${deadEndNotice}${body}` }] }
+})
 
 server.registerTool('run_extraction', {
   title: 'Run Extraction',
