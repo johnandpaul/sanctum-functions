@@ -1,7 +1,15 @@
 {
   "permissions": {
     "allow": [
-      "WebFetch(domain:support.claude.com)"
+      "WebFetch(domain:support.claude.com)",
+      "Read(//c/Users/John Figs/vault/03-resources/**)",
+      "Read(//c/Users/John Figs/vault/01-projects/sanctum/**)",
+      "Bash(python3:*)",
+      "Bash(supabase functions:*)",
+      "Bash(supabase projects:*)",
+      "Bash(curl:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m ':*)"
     ]
   }
 }

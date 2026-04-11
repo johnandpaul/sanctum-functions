@@ -1,2 +1,5 @@
 cloudflared.deb
 node_modules/
+backfill-log.jsonl
+backfill-summary.txt
+.env

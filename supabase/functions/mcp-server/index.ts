@@ -363,6 +363,11 @@ ${raw || ""}
   headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SUPABASE_ANON_KEY}` },
       body: JSON.stringify({ path: fileName, content: note, project: project || '' })
     })
+    fetch('https://ozezxrmaoukpqjshimys.supabase.co/functions/v1/intelligence-pipeline', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}` },
+      body: JSON.stringify({ path: fileName, content: note, project: project || '' })
+    }).catch(() => {})
     updateVaultIndex('add', fileName.substring(0, fileName.lastIndexOf('/') + 1), fileName.split('/').pop() || '', { type: 'brainstorm', purpose, status: 'active', tags: tagList }).catch(() => {});
   }
 
@@ -497,6 +502,11 @@ ${content}
   headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SUPABASE_ANON_KEY}` },
       body: JSON.stringify({ path: fileName, content: note, project: project || '' })
     })
+    fetch('https://ozezxrmaoukpqjshimys.supabase.co/functions/v1/intelligence-pipeline', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}` },
+      body: JSON.stringify({ path: fileName, content: note, project: project || '' })
+    }).catch(() => {})
     updateVaultIndex('add', fileName.substring(0, fileName.lastIndexOf('/') + 1), fileName.split('/').pop() || '', { type: 'resource', purpose, status: 'active', tags: tagList }).catch(() => {});
   }
 
@@ -1991,6 +2001,39 @@ server.registerTool('debug_folder_list', {
     content: [{ type: "text", text: `Status: ${listRes.status}\nRaw response:\n${raw}` }]
   };
 });
+
+server.registerTool('run_extraction', {
+  title: 'Run Extraction',
+  description: "Run the intelligence pipeline on an existing vault note by path. Reads the note from Obsidian, then runs extraction, relationship, and contradiction agents. Use for the one-time backfill of existing notes after Phase 2 deploy.",
+  inputSchema: {
+    note_path: z.string().describe("Full path to the note, e.g. '01-projects/sigyls/2026-02-28-ada-design.md'"),
+  },
+}, async ({ note_path }) => {
+  const readResponse = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(note_path)}`, {
+    headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
+  })
+  if (!readResponse.ok) {
+    return { content: [{ type: "text", text: `❌ Note not found: ${note_path}` }] }
+  }
+  const content = await readResponse.text()
+
+  const pipelineResponse = await fetch('https://ozezxrmaoukpqjshimys.supabase.co/functions/v1/intelligence-pipeline', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}` },
+    body: JSON.stringify({ path: note_path, content, project: '' })
+  })
+  if (!pipelineResponse.ok) {
+    const err = await pipelineResponse.text()
+    return { content: [{ type: "text", text: `❌ Pipeline failed (${pipelineResponse.status}): ${err}` }] }
+  }
+  const result = await pipelineResponse.json()
+  return {
+    content: [{
+      type: "text",
+      text: `✅ Extraction complete for ${note_path}\n• Entities: ${result.entities_extracted}\n• Decisions: ${result.decisions_extracted}\n• Note ID: ${result.note_id}`
+    }]
+  }
+})
 
 server.registerTool('generate_vault_index', {
   title: 'Generate Vault Index',
