@@ -1214,6 +1214,413 @@ function formatCrossProjectInsight(result: CrossProjectInsightResult): string {
   return lines.join('\n')
 }
 
+// ─── Daily briefing (Component 17) ────────────────────────────────────────
+
+const BRIEFING_STALE_DECISION_LIMIT = 10
+const BRIEFING_OPEN_THREAD_LIMIT = 15
+const BRIEFING_CONFLICT_LIMIT = 5
+const BRIEFING_RECURRING_Q_LIMIT = 5
+const BRIEFING_STALE_DAYS = 30
+const BRIEFING_CROSS_PROJECT_DAYS = 7
+const BRIEFING_CROSS_PROJECT_CONF_MIN = 0.6
+const BRIEFING_HOT_CONTEXT_TTL_DAYS = 14
+
+interface BriefingStaleDecision {
+  id: string
+  decision_text: string
+  project: string | null
+  decided_at: string
+  days_stale: number
+  note_id: string | null
+  note_path: string | null
+}
+
+interface BriefingOpenThread {
+  thread: string
+  session_date: string
+}
+
+interface BriefingConflict {
+  id: string
+  conflict_description: string
+  decision_a_text: string
+  decision_b_text: string
+  detected_at: string
+}
+
+interface BriefingRecurringQuestion {
+  id: string
+  question_text: string
+  ask_count: number
+  project: string | null
+  last_asked_at: string
+}
+
+interface BriefingCrossProject {
+  edge_count: number
+  projects_involved: string[]
+  narrative: string | null
+  edges: CrossProjectEdge[]
+}
+
+interface DailyBriefingResult {
+  generated_at: string
+  stale_decisions: BriefingStaleDecision[]
+  open_threads: BriefingOpenThread[]
+  unresolved_conflicts: BriefingConflict[]
+  recurring_questions: BriefingRecurringQuestion[]
+  cross_project: BriefingCrossProject
+  hot_context_written: number
+  dry_run: boolean
+  warnings: string[]
+  briefing_error?: string
+}
+
+async function internalGenerateDailyBriefing(dry_run: boolean = false): Promise<DailyBriefingResult> {
+  const warnings: string[] = []
+  const nowIso = new Date().toISOString()
+
+  // ─── Section 1: Stale decisions ───────────────────────────────────────
+  let stale_decisions: BriefingStaleDecision[] = []
+  try {
+    const staleBoundary = isoDaysAgo(BRIEFING_STALE_DAYS)
+    const { data: decRows, error: decErr } = await supabase
+      .from('decisions')
+      .select('id, decision_text, project, decided_at, note_id')
+      .eq('status', 'active')
+      .lte('decided_at', staleBoundary)
+      .order('decided_at', { ascending: true })
+      .limit(BRIEFING_STALE_DECISION_LIMIT)
+    if (decErr) throw decErr
+
+    const rows = (decRows ?? []) as Array<{
+      id: string
+      decision_text: string
+      project: string | null
+      decided_at: string
+      note_id: string | null
+    }>
+
+    const noteIds = rows.map(r => r.note_id).filter((x): x is string => !!x)
+    const pathById = new Map<string, string>()
+    if (noteIds.length > 0) {
+      const { data: noteRows } = await supabase
+        .from('notes')
+        .select('id, path')
+        .in('id', noteIds)
+      for (const n of (noteRows ?? []) as Array<{ id: string; path: string }>) {
+        pathById.set(n.id, n.path)
+      }
+    }
+
+    const todayMs = Date.now()
+    stale_decisions = rows.map(r => {
+      const decidedMs = new Date(r.decided_at + 'T00:00:00Z').getTime()
+      const days_stale = Math.floor((todayMs - decidedMs) / 86400000)
+      return {
+        id: r.id,
+        decision_text: r.decision_text,
+        project: r.project,
+        decided_at: r.decided_at,
+        days_stale,
+        note_id: r.note_id,
+        note_path: r.note_id ? (pathById.get(r.note_id) ?? null) : null,
+      }
+    })
+  } catch (err) {
+    warnings.push(`stale_decisions fetch failed: ${(err as Error).message}`)
+  }
+
+  // ─── Section 2: Open threads from last 3 sessions ─────────────────────
+  const open_threads: BriefingOpenThread[] = []
+  try {
+    const { data: sessRows, error: sessErr } = await supabase
+      .from('session_log')
+      .select('session_date, open_threads')
+      .order('session_date', { ascending: false })
+      .limit(3)
+    if (sessErr) throw sessErr
+
+    const seen = new Set<string>()
+    for (const row of (sessRows ?? []) as Array<{ session_date: string; open_threads: string[] | null }>) {
+      const threads = row.open_threads ?? []
+      for (const t of threads) {
+        if (!t || typeof t !== 'string') continue
+        const trimmed = t.trim()
+        const norm = trimmed.toLowerCase()
+        if (!norm || seen.has(norm)) continue
+        seen.add(norm)
+        open_threads.push({ thread: trimmed, session_date: row.session_date })
+        if (open_threads.length >= BRIEFING_OPEN_THREAD_LIMIT) break
+      }
+      if (open_threads.length >= BRIEFING_OPEN_THREAD_LIMIT) break
+    }
+  } catch (err) {
+    warnings.push(`open_threads fetch failed: ${(err as Error).message}`)
+  }
+
+  // ─── Section 3: Unresolved conflicts ──────────────────────────────────
+  let unresolved_conflicts: BriefingConflict[] = []
+  try {
+    const { data: conflictRows, error: conflictErr } = await supabase
+      .from('conflicts')
+      .select('id, decision_id_a, decision_id_b, conflict_description, detected_at')
+      .eq('status', 'unresolved')
+      .order('detected_at', { ascending: false })
+      .limit(BRIEFING_CONFLICT_LIMIT)
+    if (conflictErr) throw conflictErr
+
+    const rows = (conflictRows ?? []) as Array<{
+      id: string
+      decision_id_a: string
+      decision_id_b: string
+      conflict_description: string
+      detected_at: string
+    }>
+
+    const decisionIds = Array.from(new Set(rows.flatMap(r => [r.decision_id_a, r.decision_id_b])))
+    const textById = new Map<string, string>()
+    if (decisionIds.length > 0) {
+      const { data: decRows } = await supabase
+        .from('decisions')
+        .select('id, decision_text')
+        .in('id', decisionIds)
+      for (const d of (decRows ?? []) as Array<{ id: string; decision_text: string }>) {
+        textById.set(d.id, d.decision_text)
+      }
+    }
+
+    unresolved_conflicts = rows.map(r => ({
+      id: r.id,
+      conflict_description: r.conflict_description,
+      decision_a_text: textById.get(r.decision_id_a) ?? '(decision not found)',
+      decision_b_text: textById.get(r.decision_id_b) ?? '(decision not found)',
+      detected_at: r.detected_at,
+    }))
+  } catch (err) {
+    warnings.push(`unresolved_conflicts fetch failed: ${(err as Error).message}`)
+  }
+
+  // ─── Section 4: Recurring questions ───────────────────────────────────
+  let recurring_questions: BriefingRecurringQuestion[] = []
+  try {
+    const { data: qRows, error: qErr } = await supabase
+      .from('recurring_questions')
+      .select('id, question_text, ask_count, project, last_asked_at')
+      .gte('ask_count', 3)
+      .eq('status', 'open')
+      .order('ask_count', { ascending: false })
+      .limit(BRIEFING_RECURRING_Q_LIMIT)
+    if (qErr) throw qErr
+
+    recurring_questions = (qRows ?? []) as BriefingRecurringQuestion[]
+  } catch (err) {
+    warnings.push(`recurring_questions fetch failed: ${(err as Error).message}`)
+  }
+
+  // ─── Section 5: Cross-project (cheap find, Sonnet only if > 0) ────────
+  let cross_project: BriefingCrossProject = {
+    edge_count: 0,
+    projects_involved: [],
+    narrative: null,
+    edges: [],
+  }
+  try {
+    const since = isoDaysAgo(BRIEFING_CROSS_PROJECT_DAYS)
+    const cheapEdges = await internalFindCrossProjectEdges(
+      since,
+      BRIEFING_CROSS_PROJECT_CONF_MIN,
+      null,
+      CROSS_PROJECT_SONNET_CAP,
+    )
+    if (cheapEdges.length > 0) {
+      const insight = await internalCrossProjectInsight(since, BRIEFING_CROSS_PROJECT_CONF_MIN, null)
+      cross_project = {
+        edge_count: insight.edge_count,
+        projects_involved: insight.projects_involved,
+        narrative: insight.narrative,
+        edges: insight.edges,
+      }
+      if (insight.insight_error) warnings.push(insight.insight_error)
+    }
+  } catch (err) {
+    warnings.push(`cross_project fetch failed: ${(err as Error).message}`)
+  }
+
+  // ─── Write to hot_context ─────────────────────────────────────────────
+  let hot_context_written = 0
+  if (!dry_run) {
+    const ttlExpiresAt = new Date(Date.now() + BRIEFING_HOT_CONTEXT_TTL_DAYS * 86400000).toISOString()
+    const rowsToInsert: Array<{
+      context_type: string
+      project: string | null
+      content: string
+      relevance_score: number
+      expires_at: string | null
+      source_note_id: string | null
+    }> = []
+
+    for (const d of stale_decisions) {
+      const proj = d.project ? `[${d.project}] ` : ''
+      rowsToInsert.push({
+        context_type: 'open_thread',
+        project: d.project,
+        content: `STALE (${d.days_stale}d): ${proj}${d.decision_text}`,
+        relevance_score: 0.9,
+        expires_at: ttlExpiresAt,
+        source_note_id: d.note_id,
+      })
+    }
+
+    for (const t of open_threads) {
+      rowsToInsert.push({
+        context_type: 'open_thread',
+        project: null,
+        content: `THREAD: ${t.thread}`,
+        relevance_score: 0.8,
+        expires_at: ttlExpiresAt,
+        source_note_id: null,
+      })
+    }
+
+    for (const c of unresolved_conflicts) {
+      rowsToInsert.push({
+        context_type: 'flagged_conflict',
+        project: null,
+        content: `CONFLICT: ${c.conflict_description} — ${c.decision_a_text} vs ${c.decision_b_text}`,
+        relevance_score: 1.0,
+        expires_at: null,
+        source_note_id: null,
+      })
+    }
+
+    for (const q of recurring_questions) {
+      rowsToInsert.push({
+        context_type: 'open_thread',
+        project: q.project,
+        content: `QUESTION (${q.ask_count}×): ${q.question_text}`,
+        relevance_score: 0.7,
+        expires_at: ttlExpiresAt,
+        source_note_id: null,
+      })
+    }
+
+    if (rowsToInsert.length > 0) {
+      try {
+        const { data: inserted, error: insErr } = await supabase
+          .from('hot_context')
+          .insert(rowsToInsert)
+          .select('id')
+        if (insErr) throw insErr
+        hot_context_written = (inserted ?? []).length
+      } catch (err) {
+        warnings.push(`hot_context insert failed: ${(err as Error).message}`)
+      }
+    }
+  }
+
+  const result: DailyBriefingResult = {
+    generated_at: nowIso,
+    stale_decisions,
+    open_threads,
+    unresolved_conflicts,
+    recurring_questions,
+    cross_project,
+    hot_context_written,
+    dry_run,
+    warnings,
+  }
+  if (warnings.length > 0) result.briefing_error = warnings.join(' | ')
+  return result
+}
+
+function formatDailyBriefing(result: DailyBriefingResult): string {
+  const today = result.generated_at.split('T')[0]
+  const lines: string[] = [`# Daily Briefing — ${today}`]
+  if (result.dry_run) lines.push(`_(dry_run — no hot_context writes)_`)
+  if (result.briefing_error) lines.push(`⚠️ ${result.briefing_error}`)
+  lines.push('')
+
+  lines.push(`## ⏳ Stale decisions (${result.stale_decisions.length})`)
+  if (result.stale_decisions.length === 0) {
+    lines.push('_(none)_')
+  } else {
+    for (const d of result.stale_decisions) {
+      const proj = d.project ? `[${d.project}] ` : ''
+      lines.push(`- ${proj}${d.decision_text}  (${d.days_stale} days stale, decided ${d.decided_at})`)
+      if (d.note_path) lines.push(`  📄 ${d.note_path}`)
+    }
+  }
+  lines.push('')
+
+  lines.push(`## 🧵 Open threads (${result.open_threads.length})`)
+  if (result.open_threads.length === 0) {
+    lines.push('_(none)_')
+  } else {
+    for (const t of result.open_threads) {
+      lines.push(`- ${t.thread}  (session ${t.session_date})`)
+    }
+  }
+  lines.push('')
+
+  lines.push(`## ⚠️ Unresolved conflicts (${result.unresolved_conflicts.length})`)
+  if (result.unresolved_conflicts.length === 0) {
+    lines.push('_(none)_')
+  } else {
+    for (const c of result.unresolved_conflicts) {
+      lines.push(`- ${c.conflict_description}`)
+      lines.push(`   A: ${c.decision_a_text}`)
+      lines.push(`   B: ${c.decision_b_text}`)
+      lines.push(`   detected ${c.detected_at.split('T')[0]}`)
+    }
+  }
+  lines.push('')
+
+  lines.push(`## 🔁 Recurring questions (${result.recurring_questions.length})`)
+  if (result.recurring_questions.length === 0) {
+    lines.push('_(none)_')
+  } else {
+    for (const q of result.recurring_questions) {
+      const proj = q.project ? `, ${q.project}` : ''
+      lines.push(`- ${q.question_text}  (${q.ask_count}×, last asked ${q.last_asked_at}${proj})`)
+    }
+  }
+  lines.push('')
+
+  lines.push(`## 🌐 Cross-project insight`)
+  if (result.cross_project.edge_count === 0) {
+    lines.push('_(no cross-project edges in last 7 days)_')
+  } else {
+    lines.push(`${result.cross_project.edge_count} edges across: ${result.cross_project.projects_involved.join(', ')}`)
+    lines.push('')
+    if (result.cross_project.narrative) lines.push(result.cross_project.narrative)
+    if (result.cross_project.edges.length > 0) {
+      lines.push('', '### Edges')
+      for (const e of result.cross_project.edges) {
+        const arrow = SYMMETRIC_EDGE_TYPES.has(e.relationship_type)
+          ? `↔ ${e.relationship_type} ↔`
+          : `→ ${e.relationship_type} →`
+        lines.push(`[${e.a.project}] ${e.a.path}  ${arrow}  [${e.b.project}] ${e.b.path}  (${e.confidence.toFixed(2)})`)
+      }
+    }
+  }
+  lines.push('')
+
+  lines.push('---')
+  if (result.dry_run) {
+    const wouldHaveWritten =
+      result.stale_decisions.length +
+      result.open_threads.length +
+      result.unresolved_conflicts.length +
+      result.recurring_questions.length
+    lines.push(`📦 dry_run — would have written ${wouldHaveWritten} rows to hot_context`)
+  } else {
+    lines.push(`📦 Wrote ${result.hot_context_written} rows to hot_context`)
+  }
+
+  return lines.join('\n')
+}
+
 const app = new Hono()
 const server = new McpServer({ name: 'sanctum-vault', version: '1.0.0' })
 
@@ -3905,6 +4312,17 @@ server.registerTool('cross_project_insight', {
   return { content: [{ type: "text", text: formatCrossProjectInsight(result) }] }
 })
 
+server.registerTool('generate_daily_briefing', {
+  title: 'Generate Daily Briefing',
+  description: "Capstone briefing tool. Surfaces stale decisions (>30d active), open threads from the last 3 session_log rows, unresolved conflicts, recurring questions (asked 3+ times, status=open), and cross-project connections from the knowledge graph. Writes actionable items to hot_context for persistence across sessions; returns a formatted markdown briefing. Run once per day or whenever you want a fresh snapshot of what's outstanding across John's vault.",
+  inputSchema: {
+    dry_run: z.boolean().optional().describe("If true, skip hot_context writes (testing). Default false."),
+  },
+}, async ({ dry_run }) => {
+  const result = await internalGenerateDailyBriefing(dry_run ?? false)
+  return { content: [{ type: "text", text: formatDailyBriefing(result) }] }
+})
+
 server.registerTool('route_query', {
   title: 'Route Query (Smart Search)',
   description: "PREFERRED TOOL for any natural language question about John's vault. Always try this FIRST for questions like 'what did I decide about X', 'how should I approach Y', 'what's the status of Z', 'what do I know about...', or any conceptual/exploratory query. Classifies query intent using Haiku, then automatically routes to the optimal retrieval strategy (semantic search, decision history, entity lookup, current status, synthesis, or cross-project insight). Includes dead-end memory check for 'how should I approach X' questions. Only fall back to search_vault or semantic_search if route_query returns no useful results.",
@@ -4133,6 +4551,25 @@ app.get('/cron/update-staleness', async (c) => {
   try {
     const result = await internalUpdateStalenessScores()
     return c.json({ ok: true, total: result.total, updated: result.updated, skipped: result.skipped, errors: result.errors })
+  } catch (err) {
+    return c.json({ ok: false, error: String(err) }, 500)
+  }
+})
+
+app.get('/cron/daily-briefing', async (c) => {
+  try {
+    const result = await internalGenerateDailyBriefing(false)
+    return c.json({
+      ok: true,
+      generated_at: result.generated_at,
+      stale_decisions: result.stale_decisions.length,
+      open_threads: result.open_threads.length,
+      unresolved_conflicts: result.unresolved_conflicts.length,
+      recurring_questions: result.recurring_questions.length,
+      cross_project_edges: result.cross_project.edge_count,
+      hot_context_written: result.hot_context_written,
+      warnings: result.warnings,
+    })
   } catch (err) {
     return c.json({ ok: false, error: String(err) }, 500)
   }
