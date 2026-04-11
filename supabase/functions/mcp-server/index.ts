@@ -697,6 +697,46 @@ function renderEdgeArrow(relType: string, direction: 'outgoing' | 'incoming'): s
   return direction === 'outgoing' ? `→ ${relType} →` : `← ${relType} ←`
 }
 
+// ─── Session close helpers (Component 24 + 32 + 27 + 34 + 23) ────────────
+
+function internalNormalizeQuestion(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[?!.,:;"'`()\[\]{}]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+async function internalExtractQuestions(summary: string): Promise<string[]> {
+  const prompt = `You are extracting questions from a session summary for John's knowledge vault.
+
+Read the summary and return every distinct question John posed during the session — both questions he asked Claude and questions he raised for himself to think about later. Do NOT invent questions that aren't in the summary.
+
+Rules:
+- Each question should be a single sentence ending with a question mark.
+- Canonicalize — if the same question is asked twice in slightly different words, return it only once.
+- Ignore rhetorical asides and clarifying sub-questions that are immediately answered.
+- If there are no questions, return an empty array.
+
+Return ONLY valid JSON, no prose, no code fences:
+{"questions":["...","..."]}
+
+Summary: ${JSON.stringify(summary)}`
+
+  try {
+    const raw = await callHaiku(prompt, 512)
+    const cleaned = raw.trim().replace(/^```(?:json)?\s*/, '').replace(/\s*```$/, '')
+    const parsed = JSON.parse(cleaned)
+    if (!parsed || !Array.isArray(parsed.questions)) return []
+    return parsed.questions
+      .filter((q: unknown) => typeof q === 'string' && q.trim().length > 0)
+      .map((q: string) => q.trim())
+  } catch {
+    // Non-fatal — skip question bank update for this session
+    return []
+  }
+}
+
 const app = new Hono()
 const server = new McpServer({ name: 'sanctum-vault', version: '1.0.0' })
 
@@ -3106,6 +3146,254 @@ server.registerTool('get_related_notes', {
         lines.push(...mediumRows.map(renderRow))
       }
     }
+  }
+
+  return { content: [{ type: "text", text: lines.join('\n') }] }
+})
+
+server.registerTool('close_session', {
+  title: 'Close Session',
+  description: "Writes a structured summary of a working session to session_log (C24), captures abandoned approaches (C32), runs the retrieval feedback loop on notes loaded vs referenced (C27), extracts recurring questions into the question bank (C34), and applies decision lifecycle updates (C23). Stateless — the caller passes a payload describing what happened. Only 'summary' is required. Reports partial success per sub-component; a failure in one area does not roll back session_log insertion. Use at the end of every working session.",
+  inputSchema: {
+    summary: z.string().describe("Narrative summary of the session"),
+    session_date: z.string().optional().describe("ISO date YYYY-MM-DD. Defaults to today."),
+    projects_touched: z.array(z.string()).optional().describe("Freeform project slugs worked on this session"),
+    decisions_made: z.array(z.string()).optional().describe("UUIDs of decisions created or meaningfully modified. Not FK-validated — pass-through as given."),
+    notes_saved: z.array(z.string()).optional().describe("Vault paths of notes created or updated this session. Unresolved paths are dropped with warnings."),
+    notes_loaded: z.array(z.string()).optional().describe("C27 input: vault paths that load_session_context served. Ephemeral — not persisted, used to compute usefulness feedback."),
+    notes_referenced: z.array(z.string()).optional().describe("C27 input: vault paths actually used in session work. Ephemeral — notes here get usefulness_score bumped by 0.1."),
+    open_threads: z.array(z.string()).optional().describe("Unresolved questions or tasks from this session"),
+    abandoned_approaches: z.array(z.object({
+      approach: z.string(),
+      reason_failed: z.string(),
+      project: z.string().optional(),
+      related_decision_id: z.string().optional(),
+    })).optional().describe("C32 dead-end memory: what was tried and abandoned, and why"),
+    questions_asked: z.array(z.string()).optional().describe("C34 question bank: explicit list of questions posed. If omitted, Haiku extracts from summary."),
+    decision_outcomes: z.array(z.object({
+      decision_id: z.string(),
+      new_status: z.enum(['proven', 'disproven', 'abandoned']),
+      outcome_notes: z.string().optional(),
+    })).optional().describe("C23 decision lifecycle updates. Only transitions from status='active' are applied — others are counted as rejected."),
+  },
+}, async (args) => {
+  const {
+    summary,
+    session_date,
+    projects_touched,
+    decisions_made,
+    notes_saved,
+    notes_loaded,
+    notes_referenced,
+    open_threads,
+    abandoned_approaches,
+    questions_asked,
+    decision_outcomes,
+  } = args
+
+  const today = session_date ?? new Date().toISOString().split('T')[0]
+  const warnings: string[] = []
+
+  // ─── 1. Resolve note paths → IDs in one bulk query ────────────────────
+  const allPaths = Array.from(new Set([
+    ...(notes_saved ?? []),
+    ...(notes_loaded ?? []),
+    ...(notes_referenced ?? []),
+  ]))
+
+  const idByPath = new Map<string, string>()
+  if (allPaths.length > 0) {
+    const { data: noteRows } = await supabase
+      .from('notes')
+      .select('id, path')
+      .in('path', allPaths)
+    for (const n of (noteRows ?? []) as Array<{ id: string; path: string }>) {
+      idByPath.set(n.path, n.id)
+    }
+    for (const p of allPaths) {
+      if (!idByPath.has(p)) warnings.push(`unresolved path: ${p}`)
+    }
+  }
+
+  const resolveIds = (paths: string[] | undefined): string[] =>
+    (paths ?? []).map(p => idByPath.get(p)).filter((x): x is string => !!x)
+
+  const savedIds = resolveIds(notes_saved)
+  const loadedIds = resolveIds(notes_loaded)
+  const referencedIds = resolveIds(notes_referenced)
+
+  // ─── 2. Insert session_log row ────────────────────────────────────────
+  const { data: sessionRow, error: sessionErr } = await supabase
+    .from('session_log')
+    .insert({
+      session_date: today,
+      projects_touched: projects_touched && projects_touched.length > 0 ? projects_touched : null,
+      decisions_made: decisions_made && decisions_made.length > 0 ? decisions_made : null,
+      notes_saved: savedIds.length > 0 ? savedIds : null,
+      open_threads: open_threads && open_threads.length > 0 ? open_threads : null,
+      summary,
+      abandoned_approaches: abandoned_approaches ?? [],
+    })
+    .select('id')
+    .single()
+
+  if (sessionErr || !sessionRow) {
+    return {
+      content: [{
+        type: "text",
+        text: `❌ Failed to write session_log: ${sessionErr?.message ?? 'unknown error'}`,
+      }],
+    }
+  }
+  const sessionId = sessionRow.id
+
+  // ─── 3. C27 retrieval feedback loop ───────────────────────────────────
+  let bumpedCount = 0
+  let decayedCount = 0
+  let feedbackErrors = 0
+
+  const referencedSet = new Set(referencedIds)
+  const loadedOnly = loadedIds.filter(id => !referencedSet.has(id))
+
+  const applyDelta = async (ids: string[], delta: number, markUseful: boolean) => {
+    const CHUNK = 50
+    for (let i = 0; i < ids.length; i += CHUNK) {
+      const chunk = ids.slice(i, i + CHUNK)
+      const { data: existing } = await supabase
+        .from('notes')
+        .select('id, usefulness_score')
+        .in('id', chunk)
+      const byId = new Map<string, number>()
+      for (const r of (existing ?? []) as Array<{ id: string; usefulness_score: number | null }>) {
+        byId.set(r.id, r.usefulness_score ?? 0.5)
+      }
+
+      const results = await Promise.all(chunk.map(async id => {
+        const current = byId.get(id) ?? 0.5
+        const next = Math.max(0, Math.min(1, current + delta))
+        const patch: Record<string, unknown> = { usefulness_score: next }
+        if (markUseful) patch.last_useful_at = new Date().toISOString()
+        const { error } = await supabase
+          .from('notes')
+          .update(patch)
+          .eq('id', id)
+        return error ? 'error' : 'ok'
+      }))
+      for (const r of results) {
+        if (r === 'error') feedbackErrors++
+        else if (markUseful) bumpedCount++
+        else decayedCount++
+      }
+    }
+  }
+
+  if (referencedSet.size > 0) await applyDelta(Array.from(referencedSet), 0.1, true)
+  if (loadedOnly.length > 0) await applyDelta(loadedOnly, -0.05, false)
+
+  // ─── 4. C34 question bank ─────────────────────────────────────────────
+  let newQuestions = 0
+  let incrementedQuestions = 0
+  let questionErrors = 0
+
+  const questions: string[] = questions_asked && questions_asked.length > 0
+    ? questions_asked
+    : await internalExtractQuestions(summary)
+
+  for (const q of questions) {
+    const trimmed = q.trim()
+    if (!trimmed) continue
+    const canonical = internalNormalizeQuestion(trimmed)
+    if (!canonical) continue
+
+    try {
+      const { data: existing } = await supabase
+        .from('recurring_questions')
+        .select('id, ask_count')
+        .eq('canonical_form', canonical)
+        .limit(1)
+        .maybeSingle()
+
+      if (existing) {
+        const { error } = await supabase
+          .from('recurring_questions')
+          .update({
+            ask_count: (existing.ask_count ?? 1) + 1,
+            last_asked_at: today,
+          })
+          .eq('id', existing.id)
+        if (error) questionErrors++
+        else incrementedQuestions++
+      } else {
+        const { error } = await supabase
+          .from('recurring_questions')
+          .insert({
+            question_text: trimmed,
+            canonical_form: canonical,
+            first_asked_at: today,
+            last_asked_at: today,
+            ask_count: 1,
+          })
+        if (error) questionErrors++
+        else newQuestions++
+      }
+    } catch {
+      questionErrors++
+    }
+  }
+
+  // ─── 5. C23 decision outcomes ─────────────────────────────────────────
+  let outcomesApplied = 0
+  let outcomesRejected = 0
+
+  for (const outcome of (decision_outcomes ?? [])) {
+    const patch: Record<string, unknown> = { status: outcome.new_status }
+    if (outcome.outcome_notes) patch.outcome_notes = outcome.outcome_notes
+    const { data, error } = await supabase
+      .from('decisions')
+      .update(patch)
+      .eq('id', outcome.decision_id)
+      .eq('status', 'active')
+      .select('id')
+    if (error) {
+      outcomesRejected++
+      continue
+    }
+    if (Array.isArray(data) && data.length > 0) outcomesApplied++
+    else outcomesRejected++
+  }
+
+  // ─── 6. Build response ────────────────────────────────────────────────
+  const lines: string[] = [
+    `✅ Session closed — ${today}`,
+    `session_log ID: ${sessionId}`,
+    '',
+    `• Projects touched: ${(projects_touched ?? []).join(', ') || '(none)'}`,
+    `• Decisions made: ${(decisions_made ?? []).length}  |  Notes saved: ${savedIds.length}  |  Open threads: ${(open_threads ?? []).length}`,
+    `• Abandoned approaches: ${(abandoned_approaches ?? []).length}`,
+  ]
+
+  if ((notes_loaded ?? []).length > 0 || (notes_referenced ?? []).length > 0) {
+    lines.push('', '🔁 Retrieval feedback (C27)')
+    lines.push(`• Bumped usefulness: ${bumpedCount} notes`)
+    lines.push(`• Decayed usefulness: ${decayedCount} notes`)
+    if (feedbackErrors > 0) lines.push(`• Errors: ${feedbackErrors}`)
+  }
+
+  if (questions.length > 0) {
+    lines.push('', '❓ Question bank (C34)')
+    lines.push(`• New: ${newQuestions}  |  Re-asked: ${incrementedQuestions}`)
+    if (questionErrors > 0) lines.push(`• Errors: ${questionErrors}`)
+  }
+
+  if ((decision_outcomes ?? []).length > 0) {
+    lines.push('', '📜 Decision outcomes (C23)')
+    lines.push(`• Applied: ${outcomesApplied}`)
+    lines.push(`• Rejected: ${outcomesRejected}`)
+  }
+
+  if (warnings.length > 0) {
+    lines.push('', '⚠️ Warnings')
+    lines.push(...warnings.map(w => `• ${w}`))
   }
 
   return { content: [{ type: "text", text: lines.join('\n') }] }
