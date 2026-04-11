@@ -716,6 +716,12 @@ function renderEdgeArrow(relType: string, direction: 'outgoing' | 'incoming'): s
   return direction === 'outgoing' ? `→ ${relType} →` : `← ${relType} ←`
 }
 
+function isoDaysAgo(days: number): string {
+  const d = new Date()
+  d.setUTCDate(d.getUTCDate() - days)
+  return d.toISOString().split('T')[0]
+}
+
 // ─── Session close helpers (Component 24 + 32 + 27 + 34 + 23) ────────────
 
 function internalNormalizeQuestion(text: string): string {
@@ -1019,6 +1025,190 @@ function formatSynthesis(result: SynthesisResult): string {
     lines.push('', '## Sources')
     for (const p of result.note_sources) lines.push(`📄 ${p}`)
     if (result.decision_matched) lines.push(`🎯 Decision chain matched on topic keywords`)
+  }
+
+  return lines.join('\n')
+}
+
+// ─── Cross-project insight (Component 14) ────────────────────────────────
+
+const CROSS_PROJECT_FETCH_CAP = 200
+const CROSS_PROJECT_SONNET_CAP = 20
+
+interface CrossProjectEdge {
+  edge_id: string
+  relationship_type: string
+  confidence: number
+  created_at: string
+  a: { id: string; path: string; title: string | null; project: string }
+  b: { id: string; path: string; title: string | null; project: string }
+}
+
+interface CrossProjectInsightResult {
+  since: string
+  confidence_min: number
+  projects: string[] | null
+  edge_count: number
+  projects_involved: string[]
+  narrative: string
+  edges: CrossProjectEdge[]
+  insight_error?: string
+}
+
+async function internalFindCrossProjectEdges(
+  since: string,
+  confidence_min: number,
+  projects: string[] | null,
+  limit = CROSS_PROJECT_SONNET_CAP,
+): Promise<CrossProjectEdge[]> {
+  const { data: edgeRows } = await supabase
+    .from('note_edges')
+    .select('id, note_id_a, note_id_b, relationship_type, confidence, created_at')
+    .gte('confidence', confidence_min)
+    .gte('created_at', since)
+    .order('confidence', { ascending: false })
+    .limit(CROSS_PROJECT_FETCH_CAP)
+
+  const edges = (edgeRows ?? []) as Array<{
+    id: string
+    note_id_a: string
+    note_id_b: string
+    relationship_type: string
+    confidence: number
+    created_at: string
+  }>
+  if (edges.length === 0) return []
+
+  const noteIds = Array.from(new Set(edges.flatMap(e => [e.note_id_a, e.note_id_b])))
+  const { data: noteRows } = await supabase
+    .from('notes')
+    .select('id, path, title, project')
+    .in('id', noteIds)
+
+  const notesById = new Map<string, { id: string; path: string; title: string | null; project: string | null }>()
+  for (const n of (noteRows ?? []) as Array<{ id: string; path: string; title: string | null; project: string | null }>) {
+    notesById.set(n.id, n)
+  }
+
+  const projectFilterSet = projects && projects.length > 0 ? new Set(projects) : null
+
+  const result: CrossProjectEdge[] = []
+  for (const e of edges) {
+    const a = notesById.get(e.note_id_a)
+    const b = notesById.get(e.note_id_b)
+    if (!a || !b) continue
+    if (!a.project || !b.project) continue
+    if (a.project === b.project) continue
+    if (projectFilterSet && !projectFilterSet.has(a.project) && !projectFilterSet.has(b.project)) continue
+    result.push({
+      edge_id: e.id,
+      relationship_type: e.relationship_type,
+      confidence: e.confidence,
+      created_at: e.created_at,
+      a: { id: a.id, path: a.path, title: a.title, project: a.project },
+      b: { id: b.id, path: b.path, title: b.title, project: b.project },
+    })
+    if (result.length >= limit) break
+  }
+  return result
+}
+
+function renderCrossProjectEdgeForPrompt(e: CrossProjectEdge): string {
+  const titleA = e.a.title ?? e.a.path
+  const titleB = e.b.title ?? e.b.path
+  const arrow = SYMMETRIC_EDGE_TYPES.has(e.relationship_type)
+    ? `↔ ${e.relationship_type} ↔`
+    : `→ ${e.relationship_type} →`
+  return `[${e.a.project}] "${titleA}" — ${e.a.path}\n  ${arrow} (confidence ${e.confidence.toFixed(2)})\n[${e.b.project}] "${titleB}" — ${e.b.path}`
+}
+
+async function internalCrossProjectInsight(
+  since: string,
+  confidence_min: number,
+  projects: string[] | null,
+): Promise<CrossProjectInsightResult> {
+  const edges = await internalFindCrossProjectEdges(since, confidence_min, projects, CROSS_PROJECT_SONNET_CAP)
+
+  const projectsInvolved = Array.from(
+    new Set(edges.flatMap(e => [e.a.project, e.b.project]))
+  ).sort()
+
+  if (edges.length === 0) {
+    const projFilter = projects && projects.length > 0 ? ` involving ${projects.join(', ')}` : ''
+    return {
+      since,
+      confidence_min,
+      projects,
+      edge_count: 0,
+      projects_involved: [],
+      narrative: `No cross-project edges${projFilter} at confidence ≥ ${confidence_min} since ${since}. Either the projects are siloed or the intelligence pipeline hasn't surfaced connections yet.`,
+      edges: [],
+    }
+  }
+
+  const edgeDump = edges.map(renderCrossProjectEdgeForPrompt).join('\n\n')
+
+  const prompt = `You are analyzing cross-project connections in John's knowledge vault.
+
+Below is a list of edges — named relationships between notes — where each edge connects notes from DIFFERENT projects. These represent ideas, decisions, or patterns that echo across his work on multiple projects.
+
+Your job: write a 2-4 paragraph narrative that surfaces the themes these cross-project connections reveal. What patterns show up in multiple projects? What has he learned in one project that's influenced another? What cross-cutting concerns emerge?
+
+Rules:
+- Group by theme, not by project pair.
+- Cite specific notes by path when referencing them.
+- Do NOT invent relationships or notes not in the list.
+- If the edges are sparse or thematically incoherent, say so plainly — don't fabricate a narrative.
+- Keep it grounded — reason from what's here, don't speculate beyond it.
+
+Respond with ONLY the narrative text. No headers, no bullet lists, no code fences.
+
+--- CROSS-PROJECT EDGES ---
+${edgeDump}
+--- END EDGES ---`
+
+  let narrative = ''
+  let insight_error: string | undefined
+
+  try {
+    narrative = (await callSonnet(prompt, 2048)).trim()
+  } catch (err) {
+    insight_error = `synthesis failed: ${(err as Error).message}`
+    narrative = `⚠️ Sonnet synthesis failed. Raw edges below:\n\n${edgeDump}`
+  }
+
+  return {
+    since,
+    confidence_min,
+    projects,
+    edge_count: edges.length,
+    projects_involved: projectsInvolved,
+    narrative,
+    edges,
+    insight_error,
+  }
+}
+
+function formatCrossProjectInsight(result: CrossProjectInsightResult): string {
+  const lines: string[] = ['# Cross-project insight']
+  const projFilter = result.projects && result.projects.length > 0
+    ? result.projects.join(', ')
+    : 'all projects'
+  lines.push(`Filter: ${projFilter}`)
+  lines.push(`Since: ${result.since} | confidence ≥ ${result.confidence_min}`)
+  lines.push(`📊 ${result.edge_count} cross-project edges across: ${result.projects_involved.join(', ') || '—'}`)
+  if (result.insight_error) lines.push(`⚠️ ${result.insight_error}`)
+
+  lines.push('', result.narrative)
+
+  if (result.edges.length > 0) {
+    lines.push('', '## Edges')
+    for (const e of result.edges) {
+      const arrow = SYMMETRIC_EDGE_TYPES.has(e.relationship_type)
+        ? `↔ ${e.relationship_type} ↔`
+        : `→ ${e.relationship_type} →`
+      lines.push(`[${e.a.project}] ${e.a.path}  ${arrow}  [${e.b.project}] ${e.b.path}  (${e.confidence.toFixed(2)})`)
+    }
   }
 
   return lines.join('\n')
@@ -3699,6 +3889,22 @@ server.registerTool('synthesize_thinking_on', {
   return { content: [{ type: "text", text: formatSynthesis(result) }] }
 })
 
+server.registerTool('cross_project_insight', {
+  title: 'Cross-Project Insight',
+  description: "Surfaces connections across multiple projects in John's vault. Fetches high-confidence cross-project edges from the knowledge graph (notes in DIFFERENT projects linked by relates_to / contradicts / supports / inspired_by / etc.), then uses Claude Sonnet to synthesize the themes — what patterns echo across projects, what he's learned in one and applied to another. Use for 'what do sigyls and sono have in common', 'how does my thinking on X apply across projects', or any cross-project pattern query. Note: route_query auto-routes cross_project queries here.",
+  inputSchema: {
+    since: z.string().optional().describe("ISO date YYYY-MM-DD — only include edges created from this date forward. Default: 7 days ago."),
+    confidence_min: z.number().optional().describe("Minimum edge confidence (0-1). Default 0.6 (explicit-surface tier)."),
+    projects: z.array(z.string()).optional().describe("Optional list of project names, e.g. ['sigyls','sono']. At least one endpoint of each edge must be in this set. Default: all projects."),
+  },
+}, async ({ since, confidence_min, projects }) => {
+  const effectiveSince = since ?? isoDaysAgo(7)
+  const effectiveConfMin = confidence_min ?? 0.6
+  const effectiveProjects = projects && projects.length > 0 ? projects : null
+  const result = await internalCrossProjectInsight(effectiveSince, effectiveConfMin, effectiveProjects)
+  return { content: [{ type: "text", text: formatCrossProjectInsight(result) }] }
+})
+
 server.registerTool('route_query', {
   title: 'Route Query (Smart Search)',
   description: "PREFERRED TOOL for any natural language question about John's vault. Always try this FIRST for questions like 'what did I decide about X', 'how should I approach Y', 'what's the status of Z', 'what do I know about...', or any conceptual/exploratory query. Classifies query intent using Haiku, then automatically routes to the optimal retrieval strategy (semantic search, decision history, entity lookup, current status, synthesis, or cross-project insight). Includes dead-end memory check for 'how should I approach X' questions. Only fall back to search_vault or semantic_search if route_query returns no useful results.",
@@ -3850,19 +4056,9 @@ server.registerTool('route_query', {
     }
 
     case 'cross_project': {
-      body = `⚠️ cross_project_insight() is a Phase 4 tool (not yet built).\n   Falling back to cross-project semantic search.\n\n`
-      const results = await internalSemanticSearch(topic || query, 8, null)
-      const byProject = new Map<string, typeof results>()
-      for (const r of results) {
-        const proj = r.path.split('/')[1] ?? 'other'
-        if (!byProject.has(proj)) byProject.set(proj, [])
-        byProject.get(proj)!.push(r)
-      }
-      body += Array.from(byProject.entries())
-        .map(([proj, rows]) => `### ${proj}\n` + rows.map(r =>
-          `📄 ${r.path} (${Math.round(r.similarity * 100)}%)`
-        ).join('\n'))
-        .join('\n\n')
+      const projectFilter = project ? [project] : null
+      const result = await internalCrossProjectInsight(isoDaysAgo(7), 0.6, projectFilter)
+      body = formatCrossProjectInsight(result)
       break
     }
   }
