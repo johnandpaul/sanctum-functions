@@ -599,6 +599,104 @@ async function internalUpdateStalenessScores(dryRun = false): Promise<{
   return { updated, skipped, errors, total: rows.length, dry_run: dryRun }
 }
 
+// ─── Confidence routing on edges (Component 25) ──────────────────────────
+
+const EDGE_AUTO_SURFACE_MIN = 0.75  // strict > threshold for auto tier
+const EDGE_EXPLICIT_MIN = 0.5       // inclusive >= threshold for explicit tier
+
+interface RelatedNoteRow {
+  related_id: string
+  related_path: string
+  related_title: string | null
+  relationship_type: string
+  confidence: number
+  direction: 'outgoing' | 'incoming'
+}
+
+async function internalGetRelatedNotes(
+  noteId: string,
+  tier: 'auto' | 'medium' = 'auto',
+  limit = 10,
+): Promise<RelatedNoteRow[]> {
+  let outQ = supabase
+    .from('note_edges')
+    .select('note_id_b, relationship_type, confidence')
+    .eq('note_id_a', noteId)
+  let inQ = supabase
+    .from('note_edges')
+    .select('note_id_a, relationship_type, confidence')
+    .eq('note_id_b', noteId)
+
+  if (tier === 'auto') {
+    outQ = outQ.gt('confidence', EDGE_AUTO_SURFACE_MIN)
+    inQ = inQ.gt('confidence', EDGE_AUTO_SURFACE_MIN)
+  } else {
+    // medium: [0.5, 0.75] inclusive both ends — 0.75 exactly falls in medium per schema comment
+    outQ = outQ.gte('confidence', EDGE_EXPLICIT_MIN).lte('confidence', EDGE_AUTO_SURFACE_MIN)
+    inQ = inQ.gte('confidence', EDGE_EXPLICIT_MIN).lte('confidence', EDGE_AUTO_SURFACE_MIN)
+  }
+
+  const [outRes, inRes] = await Promise.all([
+    outQ.order('confidence', { ascending: false }).limit(limit * 2),
+    inQ.order('confidence', { ascending: false }).limit(limit * 2),
+  ])
+
+  type EdgeInfo = { far: string; relationship_type: string; confidence: number; direction: 'outgoing' | 'incoming' }
+  const edges: EdgeInfo[] = []
+  for (const r of ((outRes.data ?? []) as Array<{ note_id_b: string; relationship_type: string; confidence: number }>)) {
+    edges.push({ far: r.note_id_b, relationship_type: r.relationship_type, confidence: r.confidence, direction: 'outgoing' })
+  }
+  for (const r of ((inRes.data ?? []) as Array<{ note_id_a: string; relationship_type: string; confidence: number }>)) {
+    edges.push({ far: r.note_id_a, relationship_type: r.relationship_type, confidence: r.confidence, direction: 'incoming' })
+  }
+
+  if (edges.length === 0) return []
+
+  const farIds = Array.from(new Set(edges.map(e => e.far)))
+  const { data: noteRows } = await supabase
+    .from('notes')
+    .select('id, path, title')
+    .in('id', farIds)
+  const notesById = new Map<string, { id: string; path: string; title: string | null }>()
+  for (const n of (noteRows ?? []) as Array<{ id: string; path: string; title: string | null }>) {
+    notesById.set(n.id, n)
+  }
+
+  const rows: RelatedNoteRow[] = []
+  for (const e of edges) {
+    const note = notesById.get(e.far)
+    if (!note) continue // orphaned edge — shouldn't happen under CASCADE
+    rows.push({
+      related_id: note.id,
+      related_path: note.path,
+      related_title: note.title,
+      relationship_type: e.relationship_type,
+      confidence: e.confidence,
+      direction: e.direction,
+    })
+  }
+  rows.sort((a, b) => b.confidence - a.confidence)
+  return rows.slice(0, limit)
+}
+
+const SYMMETRIC_EDGE_TYPES = new Set(['contradicts', 'supports', 'relates_to', 'inspired_by'])
+
+function renderEdgeArrow(relType: string, direction: 'outgoing' | 'incoming'): string {
+  if (SYMMETRIC_EDGE_TYPES.has(relType)) {
+    return `↔ ${relType} ↔`
+  }
+  if (relType === 'supersedes') {
+    return direction === 'outgoing' ? '→ supersedes →' : '← superseded by ←'
+  }
+  if (relType === 'is_part_of') {
+    return direction === 'outgoing' ? '→ part of →' : '← contains ←'
+  }
+  if (relType === 'references') {
+    return direction === 'outgoing' ? '→ references →' : '← referenced by ←'
+  }
+  return direction === 'outgoing' ? `→ ${relType} →` : `← ${relType} ←`
+}
+
 const app = new Hono()
 const server = new McpServer({ name: 'sanctum-vault', version: '1.0.0' })
 
@@ -2944,6 +3042,73 @@ server.registerTool('update_staleness_scores', {
       text: `${icon} Staleness scores${modeLabel}\n• Total notes: ${result.total}\n• ${verb}: ${result.updated}\n• Skipped (noise floor <0.01): ${result.skipped}\n• Errors: ${result.errors}`,
     }],
   }
+})
+
+server.registerTool('get_related_notes', {
+  title: 'Get Related Notes',
+  description: "List notes connected to a given note via the knowledge graph (note_edges). By default returns only auto-surfaced high-confidence edges (>0.75). Set include_medium_confidence=true to also return the explicit tier (0.5-0.75) in a separate section. Edges below 0.5 are never stored. Relationship types render with directional arrows (→/←) for supersedes/is_part_of/references where direction carries meaning, and symmetric arrows (↔) for contradicts/supports/relates_to/inspired_by. Use when asking 'what's connected to this note', 'what contradicts X', 'what does Y supersede', etc.",
+  inputSchema: {
+    note_path: z.string().describe("Full vault path to the anchor note, e.g. '01-projects/sigyls/design.md'"),
+    include_medium_confidence: z.boolean().optional().describe("If true, also return 0.5-0.75 edges in a separate section. Default false."),
+    limit: z.number().optional().describe("Max related notes per tier. Default 10."),
+  },
+}, async ({ note_path, include_medium_confidence, limit }) => {
+  const effectiveLimit = limit ?? 10
+
+  const { data: anchorRow, error: anchorErr } = await supabase
+    .from('notes')
+    .select('id, path, title')
+    .eq('path', note_path)
+    .maybeSingle()
+  if (anchorErr || !anchorRow) {
+    return { content: [{ type: "text", text: `❌ Note not found: ${note_path}` }] }
+  }
+
+  let autoRows: RelatedNoteRow[] = []
+  let mediumRows: RelatedNoteRow[] = []
+  if (include_medium_confidence) {
+    const [a, m] = await Promise.all([
+      internalGetRelatedNotes(anchorRow.id, 'auto', effectiveLimit),
+      internalGetRelatedNotes(anchorRow.id, 'medium', effectiveLimit),
+    ])
+    autoRows = a
+    mediumRows = m
+  } else {
+    autoRows = await internalGetRelatedNotes(anchorRow.id, 'auto', effectiveLimit)
+  }
+
+  const renderRow = (r: RelatedNoteRow) => {
+    const arrow = renderEdgeArrow(r.relationship_type, r.direction)
+    const label = r.related_title ? `${r.related_title} (${r.related_path})` : r.related_path
+    return `  ${arrow} ${label}  [${r.confidence.toFixed(2)}]`
+  }
+
+  const lines: string[] = [
+    `# Related notes for: ${anchorRow.title ?? anchorRow.path}`,
+    `📄 ${anchorRow.path}`,
+    '',
+  ]
+
+  if (autoRows.length === 0 && mediumRows.length === 0) {
+    lines.push('(no related notes found)')
+  } else {
+    lines.push(`## High-confidence (auto, >0.75) — ${autoRows.length}`)
+    if (autoRows.length === 0) {
+      lines.push('  (none)')
+    } else {
+      lines.push(...autoRows.map(renderRow))
+    }
+    if (include_medium_confidence) {
+      lines.push('', `## Medium-confidence (explicit, 0.5-0.75) — ${mediumRows.length}`)
+      if (mediumRows.length === 0) {
+        lines.push('  (none)')
+      } else {
+        lines.push(...mediumRows.map(renderRow))
+      }
+    }
+  }
+
+  return { content: [{ type: "text", text: lines.join('\n') }] }
 })
 
 server.registerTool('route_query', {
