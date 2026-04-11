@@ -146,15 +146,55 @@ async function internalSemanticSearch(
   query: string,
   limit = 5,
   project: string | null = null
-): Promise<Array<{ path: string; similarity: number; content: string }>> {
+): Promise<Array<{
+  path: string
+  similarity: number
+  content: string
+  staleness: number
+  authority: number
+  retrieval_rank: number
+}>> {
+  // Over-fetch so re-ranking has room to promote high-authority/fresh results
+  const overfetch = Math.max(limit * 4, 20)
   const res = await fetch('https://ozezxrmaoukpqjshimys.supabase.co/functions/v1/semantic-search', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query, limit, project }),
+    body: JSON.stringify({ query, limit: overfetch, project }),
   })
   if (!res.ok) return []
   const data = await res.json()
-  return (data.results ?? []) as Array<{ path: string; similarity: number; content: string }>
+  const raw = (data.results ?? []) as Array<{ path: string; similarity: number; content: string }>
+  if (raw.length === 0) return []
+
+  const paths = raw.map(r => r.path)
+  const { data: noteRows } = await supabase
+    .from('notes')
+    .select('path, staleness_score, authority_weight')
+    .in('path', paths)
+
+  const metaByPath = new Map<string, { staleness: number; authority: number }>()
+  for (const n of (noteRows ?? []) as Array<{ path: string; staleness_score: number | null; authority_weight: number | null }>) {
+    metaByPath.set(n.path, {
+      staleness: n.staleness_score ?? 1.0,
+      authority: n.authority_weight ?? 0.5,
+    })
+  }
+
+  const reranked = raw.map(r => {
+    // Notes missing from the notes table (pre-backfill) get neutral defaults
+    const meta = metaByPath.get(r.path) ?? { staleness: 1.0, authority: 0.5 }
+    const retrieval_rank = r.similarity * (meta.staleness * 0.4 + meta.authority * 0.6)
+    return {
+      path: r.path,
+      similarity: r.similarity,
+      content: r.content,
+      staleness: meta.staleness,
+      authority: meta.authority,
+      retrieval_rank,
+    }
+  })
+  reranked.sort((a, b) => b.retrieval_rank - a.retrieval_rank)
+  return reranked.slice(0, limit)
 }
 
 // ─── Decision history (Component 13) ─────────────────────────────────────
@@ -478,6 +518,85 @@ function formatConflicts(result: ConflictsResult): string {
   }).join('\n\n')
 
   return `${header}\n\n${blocks}`
+}
+
+// ─── Staleness scoring (Component 21) ────────────────────────────────────
+
+function pickHalfLife(row: {
+  type: string | null
+  artifact_type: string | null
+  status: string | null
+}): number {
+  const t = (row.type ?? '').toLowerCase()
+  const a = (row.artifact_type ?? '').toLowerCase()
+
+  // Reference material — long-lived
+  if (a === 'spec' || a === 'reference') return 730
+  if (t === 'resource') return 365
+
+  // Time-sensitive snapshots
+  if (a === 'status' || t === 'status') return 14
+  if (t === 'digest-item' || a === 'digest-item') return 30
+
+  // Thinking artifacts
+  if (t === 'brainstorm') return 60
+  if (t === 'decision') return 180
+  if (t === 'project') return 30
+
+  return 90 // default
+}
+
+async function internalUpdateStalenessScores(dryRun = false): Promise<{
+  updated: number
+  skipped: number
+  errors: number
+  total: number
+  dry_run: boolean
+}> {
+  const { data: rows, error } = await supabase
+    .from('notes')
+    .select('id, type, artifact_type, status, updated_at, staleness_score')
+  if (error || !rows) {
+    return { updated: 0, skipped: 0, errors: 1, total: 0, dry_run: dryRun }
+  }
+
+  const now = Date.now()
+  const LN2 = Math.log(2)
+  const DAY_MS = 1000 * 60 * 60 * 24
+  const NOISE_FLOOR = 0.01
+  const CHUNK = 50
+
+  let updated = 0
+  let skipped = 0
+  let errors = 0
+
+  for (let i = 0; i < rows.length; i += CHUNK) {
+    const chunk = rows.slice(i, i + CHUNK)
+    const results = await Promise.all(chunk.map(async row => {
+      const halfLife = pickHalfLife(row)
+      const anchor = row.updated_at ? new Date(row.updated_at).getTime() : now
+      const ageDays = Math.max(0, (now - anchor) / DAY_MS)
+      const newScore = Math.exp(-LN2 * ageDays / halfLife)
+      const currentScore = row.staleness_score ?? 1.0
+
+      // Noise floor — skip writes for sub-0.01 drifts to avoid churn
+      if (Math.abs(newScore - currentScore) < NOISE_FLOOR) return 'skip'
+      if (dryRun) return 'updated' // count it but don't actually write
+
+      const { error: updErr } = await supabase
+        .from('notes')
+        .update({ staleness_score: newScore })
+        .eq('id', row.id)
+      return updErr ? 'error' : 'updated'
+    }))
+    for (const r of results) {
+      if (r === 'updated') updated++
+      else if (r === 'skip') skipped++
+      else errors++
+    }
+  }
+
+  return { updated, skipped, errors, total: rows.length, dry_run: dryRun }
 }
 
 const app = new Hono()
@@ -2808,6 +2927,25 @@ server.registerTool('resolve_conflict', {
   return { content: [{ type: "text", text: lines.join('\n') }] }
 })
 
+server.registerTool('update_staleness_scores', {
+  title: 'Update Staleness Scores',
+  description: "Recompute staleness_score for every note using exponential decay from updated_at. Each note gets a half-life based on type/artifact_type (specs decay over 2 years, status notes over 2 weeks, default 90 days). Staleness feeds the retrieval_rank formula: similarity × (staleness × 0.4 + authority × 0.6). Writes are skipped when the new score drifts by less than 0.01 from the current value. Normally runs daily via cron — call manually after bulk imports or to backfill newly-added notes. Set dry_run=true to preview counts without writing.",
+  inputSchema: {
+    dry_run: z.boolean().optional().describe("If true, report what would change without writing. Default false."),
+  },
+}, async ({ dry_run }) => {
+  const result = await internalUpdateStalenessScores(dry_run ?? false)
+  const icon = result.errors === 0 ? (result.dry_run ? '🔍' : '✅') : '⚠️'
+  const modeLabel = result.dry_run ? ' (dry run — no writes)' : ''
+  const verb = result.dry_run ? 'Would update' : 'Updated'
+  return {
+    content: [{
+      type: "text",
+      text: `${icon} Staleness scores${modeLabel}\n• Total notes: ${result.total}\n• ${verb}: ${result.updated}\n• Skipped (noise floor <0.01): ${result.skipped}\n• Errors: ${result.errors}`,
+    }],
+  }
+})
+
 server.registerTool('route_query', {
   title: 'Route Query (Smart Search)',
   description: "PREFERRED TOOL for any natural language question about John's vault. Always try this FIRST for questions like 'what did I decide about X', 'how should I approach Y', 'what's the status of Z', 'what do I know about...', or any conceptual/exploratory query. Classifies query intent using Haiku, then automatically routes to the optimal retrieval strategy (semantic search, decision history, entity lookup, current status, synthesis, or cross-project insight). Includes dead-end memory check for 'how should I approach X' questions. Only fall back to search_vault or semantic_search if route_query returns no useful results.",
@@ -3039,6 +3177,15 @@ app.get('/cron/generate-index', async (c) => {
     return c.json({ ok: false, error: String(err) }, 500);
   }
 });
+
+app.get('/cron/update-staleness', async (c) => {
+  try {
+    const result = await internalUpdateStalenessScores()
+    return c.json({ ok: true, total: result.total, updated: result.updated, skipped: result.skipped, errors: result.errors })
+  } catch (err) {
+    return c.json({ ok: false, error: String(err) }, 500)
+  }
+})
 
 app.all('*', async (c) => {
   const transport = new WebStandardStreamableHTTPServerTransport()
