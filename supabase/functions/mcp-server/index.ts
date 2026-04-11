@@ -350,6 +350,136 @@ function formatDecisionHistory(result: DecisionHistoryResult): string {
   return `${header}\n\n${chainBlocks}`
 }
 
+// ─── Conflicts (Component 15) ────────────────────────────────────────────
+
+interface ConflictRow {
+  id: string
+  decision_id_a: string
+  decision_id_b: string
+  conflict_description: string
+  detected_at: string
+  status: 'unresolved' | 'acknowledged' | 'resolved'
+  resolution_notes: string | null
+}
+
+interface EnrichedConflict extends ConflictRow {
+  decision_a: DecisionRow | null
+  decision_b: DecisionRow | null
+  obsolete_because: string | null
+}
+
+interface ConflictsResult {
+  status_filter: 'unresolved' | 'acknowledged' | 'resolved' | 'all'
+  project_filter: string | null
+  total: number
+  conflicts: EnrichedConflict[]
+}
+
+const CONFLICT_COLUMNS =
+  'id, decision_id_a, decision_id_b, conflict_description, detected_at, status, resolution_notes'
+
+async function internalGetConflicts(
+  statusFilter: 'unresolved' | 'acknowledged' | 'resolved' | 'all' = 'unresolved',
+  project: string | null = null,
+  limit = 10,
+): Promise<ConflictsResult> {
+  const fetchLimit = project ? limit * 3 : limit
+
+  let q = supabase
+    .from('conflicts')
+    .select(CONFLICT_COLUMNS)
+    .order('detected_at', { ascending: false })
+    .limit(fetchLimit)
+  if (statusFilter !== 'all') q = q.eq('status', statusFilter)
+
+  const { data: conflictRows } = await q
+  const conflicts = (conflictRows ?? []) as ConflictRow[]
+  if (conflicts.length === 0) {
+    return { status_filter: statusFilter, project_filter: project, total: 0, conflicts: [] }
+  }
+
+  const decisionIds = new Set<string>()
+  for (const c of conflicts) {
+    decisionIds.add(c.decision_id_a)
+    decisionIds.add(c.decision_id_b)
+  }
+  const { data: decisionRows } = await supabase
+    .from('decisions')
+    .select(DECISION_COLUMNS)
+    .in('id', [...decisionIds])
+
+  const decisionById = new Map<string, DecisionRow>()
+  for (const d of (decisionRows ?? []) as DecisionRow[]) decisionById.set(d.id, d)
+
+  const isDead = (d: DecisionRow | null) =>
+    d !== null && (d.status === 'superseded' || d.status === 'abandoned' || d.status === 'disproven')
+
+  const enriched: EnrichedConflict[] = conflicts.map(c => {
+    const a = decisionById.get(c.decision_id_a) ?? null
+    const b = decisionById.get(c.decision_id_b) ?? null
+    const aDead = isDead(a)
+    const bDead = isDead(b)
+    let obsolete_because: string | null = null
+    if (aDead && bDead) {
+      obsolete_because = `Both decisions are now inactive (A: ${a!.status}, B: ${b!.status}).`
+    } else if (aDead) {
+      obsolete_because = `Decision A is now ${a!.status}.`
+    } else if (bDead) {
+      obsolete_because = `Decision B is now ${b!.status}.`
+    }
+    return { ...c, decision_a: a, decision_b: b, obsolete_because }
+  })
+
+  const filtered = project
+    ? enriched.filter(e => e.decision_a?.project === project || e.decision_b?.project === project)
+    : enriched
+
+  return {
+    status_filter: statusFilter,
+    project_filter: project,
+    total: filtered.length,
+    conflicts: filtered.slice(0, limit),
+  }
+}
+
+function formatConflicts(result: ConflictsResult): string {
+  const { status_filter, project_filter, total, conflicts } = result
+
+  if (conflicts.length === 0) {
+    const statusLabel = status_filter === 'all' ? '' : `${status_filter} `
+    const projLabel = project_filter ? ` for project ${project_filter}` : ''
+    return `# Conflicts\n\nNo ${statusLabel}conflicts found${projLabel}.`
+  }
+
+  const statusLabel = status_filter === 'all' ? '' : `${status_filter} `
+  const header =
+    `# Conflicts — ${total} ${statusLabel}conflict${total > 1 ? 's' : ''}\n` +
+    (project_filter ? `Filter: project=${project_filter} | ` : '') +
+    `showing ${conflicts.length} of ${total}`
+
+  const renderDecision = (label: 'A' | 'B', d: DecisionRow | null) => {
+    if (!d) return `  ${label}. ⚠️ decision not found (deleted?)`
+    const proj = d.project ? ` (${d.project})` : ''
+    return `  ${label}. [${d.decided_at} | ${d.status}]${proj} ${d.decision_text}`
+  }
+
+  const blocks = conflicts.map((c, i) => {
+    const lines = [
+      `## Conflict ${i + 1}  ·  detected ${c.detected_at.split('T')[0]}  ·  ${c.status}`,
+      `ID: ${c.id}`,
+      `Description: ${c.conflict_description}`,
+      '',
+      renderDecision('A', c.decision_a),
+      renderDecision('B', c.decision_b),
+    ]
+    if (c.obsolete_because) lines.push('', `⚠️ ${c.obsolete_because}`)
+    if (c.resolution_notes) lines.push('', `Resolution notes: ${c.resolution_notes}`)
+    return lines.join('\n')
+  }).join('\n\n')
+
+  return `${header}\n\n${blocks}`
+}
+
 const app = new Hono()
 const server = new McpServer({ name: 'sanctum-vault', version: '1.0.0' })
 
@@ -2260,6 +2390,7 @@ server.registerTool('load_session_context', {
     recentThreadRows,
     decisionRows,
     conflictRows,
+    unresolvedConflicts,
     questionRows,
     deadEndHits,
     baseNotes,
@@ -2326,6 +2457,12 @@ server.registerTool('load_session_context', {
       if (project) q = q.or(`project.eq.${project},project.is.null`)
       const { data } = await q
       return data ?? []
+    })(),
+
+    // 5b. unresolved conflicts from conflicts table (C15 bridge)
+    (async () => {
+      const result = await internalGetConflicts('unresolved', project ?? null, 10)
+      return result.conflicts
     })(),
 
     // 6. recurring questions (status=open, ask_count >= 3)
@@ -2459,11 +2596,34 @@ server.registerTool('load_session_context', {
       ).join('\n')
     : `## Recent decisions (last 7 days)\n(empty)`
 
-  const conflictsSection = scoredConflicts.length
-    ? `## Flagged conflicts (by urgency)\n` + scoredConflicts.map(c =>
+  const conflictsSection = (() => {
+    const hasHot = scoredConflicts.length > 0
+    const hasTable = (unresolvedConflicts as EnrichedConflict[]).length > 0
+    if (!hasHot && !hasTable) return `## Flagged conflicts\n(empty)`
+    const parts: string[] = ['## Flagged conflicts']
+    if (hasHot) {
+      parts.push('### From hot_context (by urgency decay)')
+      parts.push(scoredConflicts.map(c =>
         `- [urgency ${c.urgency.toFixed(2)}${c.project ? ` | ${c.project}` : ''}] ${c.content}`
-      ).join('\n')
-    : `## Flagged conflicts\n(empty)`
+      ).join('\n'))
+    }
+    if (hasTable) {
+      if (hasHot) parts.push('')
+      parts.push('### Unresolved from conflicts table')
+      const trunc = (s: string) => s.length <= 60 ? s : s.slice(0, 59) + '…'
+      parts.push((unresolvedConflicts as EnrichedConflict[]).map(c => {
+        const aLabel = c.decision_a
+          ? `[${c.decision_a.status}] ${trunc(c.decision_a.decision_text)}`
+          : 'missing'
+        const bLabel = c.decision_b
+          ? `[${c.decision_b.status}] ${trunc(c.decision_b.decision_text)}`
+          : 'missing'
+        const obsolete = c.obsolete_because ? ` ⚠️ ${c.obsolete_because}` : ''
+        return `- [${c.detected_at.split('T')[0]}] ${c.conflict_description}${obsolete}\n    A: ${aLabel}\n    B: ${bLabel}`
+      }).join('\n'))
+    }
+    return parts.join('\n')
+  })()
 
   const questionsSection = questionRows.length
     ? `## Recurring questions (ask_count ≥ 3)\n` + (questionRows as any[]).map(q =>
@@ -2485,7 +2645,7 @@ server.registerTool('load_session_context', {
     `last session: ${lastSessionRows.length ? (lastSessionRows[0] as any).session_date : 'none'}`,
     `open threads: ${openThreads.length}`,
     `decisions: ${decisionRows.length}`,
-    `conflicts: ${scoredConflicts.length}`,
+    `conflicts: ${scoredConflicts.length + (unresolvedConflicts as EnrichedConflict[]).length}`,
     `questions: ${questionRows.length}`,
     `base notes: ${basePaths.length}`,
     `project briefs: ${allProjects.length}`,
@@ -2551,6 +2711,101 @@ server.registerTool('get_decision_history', {
 }, async ({ topic, project, limit }) => {
   const result = await internalGetDecisionHistory(topic, project ?? null, limit ?? 5)
   return { content: [{ type: "text", text: formatDecisionHistory(result) }] }
+})
+
+server.registerTool('get_conflicts', {
+  title: 'Get Conflicts',
+  description: "List detected contradictions between John's decisions. Filters by status (default: unresolved) and optionally by project (conflict appears if either decision is in that project — OR semantics). Returns a compact visualization of each conflict showing both decisions, their current status, detection date, and an obsolescence hint if one of the decisions has since been superseded, abandoned, or disproven. Use when the user wants to audit conflicts, review pending contradictions, or decide which conflicts to resolve. For resolving a conflict, follow up with resolve_conflict using the ID shown in the output.",
+  inputSchema: {
+    status: z.enum(['unresolved', 'acknowledged', 'resolved', 'all']).optional()
+      .describe("Status filter. Default 'unresolved'."),
+    project: z.string().optional()
+      .describe("Optional project filter (OR semantics — matches if either decision is in this project)"),
+    limit: z.number().optional().describe("Max conflicts to return, default 10"),
+  },
+}, async ({ status, project, limit }) => {
+  const result = await internalGetConflicts(status ?? 'unresolved', project ?? null, limit ?? 10)
+  return { content: [{ type: "text", text: formatConflicts(result) }] }
+})
+
+server.registerTool('resolve_conflict', {
+  title: 'Resolve Conflict',
+  description: "Mark a detected conflict as resolved or acknowledged. For new_status='resolved' (the default), resolution_notes is required and should explain how the contradiction was settled. For new_status='acknowledged', resolution_notes is optional — this is for conflicts that are noted but parked. Returns confirmation with the before/after status transition and both decisions rendered for context.",
+  inputSchema: {
+    conflict_id: z.string().describe("The UUID of the conflict to resolve (from get_conflicts output)"),
+    resolution_notes: z.string().describe("Explanation of how the conflict was resolved. Required when new_status='resolved'; optional when new_status='acknowledged'."),
+    new_status: z.enum(['resolved', 'acknowledged']).optional().describe("New status. Default 'resolved'."),
+  },
+}, async ({ conflict_id, resolution_notes, new_status }) => {
+  const finalStatus = new_status ?? 'resolved'
+
+  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+  if (!uuidRe.test(conflict_id)) {
+    return { content: [{ type: "text", text: `❌ Invalid conflict_id — must be a UUID.` }] }
+  }
+
+  if (finalStatus === 'resolved' && (!resolution_notes || resolution_notes.trim().length === 0)) {
+    return { content: [{ type: "text", text: `❌ resolution_notes is required when new_status='resolved'. Use new_status='acknowledged' to park a conflict without notes.` }] }
+  }
+
+  const { data: beforeRow, error: beforeErr } = await supabase
+    .from('conflicts')
+    .select(CONFLICT_COLUMNS)
+    .eq('id', conflict_id)
+    .maybeSingle()
+  if (beforeErr || !beforeRow) {
+    return { content: [{ type: "text", text: `❌ Conflict not found: ${conflict_id}` }] }
+  }
+
+  const { data: afterRow, error: updateErr } = await supabase
+    .from('conflicts')
+    .update({ status: finalStatus, resolution_notes: resolution_notes?.trim() || null })
+    .eq('id', conflict_id)
+    .select(CONFLICT_COLUMNS)
+    .single()
+  if (updateErr || !afterRow) {
+    return { content: [{ type: "text", text: `❌ Update failed: ${updateErr?.message ?? 'unknown error'}` }] }
+  }
+
+  const { data: decisionRows } = await supabase
+    .from('decisions')
+    .select(DECISION_COLUMNS)
+    .in('id', [afterRow.decision_id_a, afterRow.decision_id_b])
+  const decisionById = new Map<string, DecisionRow>()
+  for (const d of (decisionRows ?? []) as DecisionRow[]) decisionById.set(d.id, d)
+  const decisionA = decisionById.get(afterRow.decision_id_a) ?? null
+  const decisionB = decisionById.get(afterRow.decision_id_b) ?? null
+
+  const today = new Date().toISOString().split('T')[0]
+  const icon = finalStatus === 'resolved' ? '✅' : '📌'
+  const actionLabel = finalStatus === 'resolved' ? 'resolved' : 'acknowledged'
+
+  const renderDecision = (label: 'A' | 'B', d: DecisionRow | null) => {
+    if (!d) return `  ${label}. ⚠️ decision not found`
+    const proj = d.project ? ` (${d.project})` : ''
+    return `  ${label}. [${d.decided_at} | ${d.status}]${proj} ${d.decision_text}`
+  }
+
+  const lines = [
+    `${icon} Conflict ${actionLabel}`,
+    `ID: ${afterRow.id}`,
+    `Status: ${beforeRow.status} → ${afterRow.status}`,
+    `Detected: ${beforeRow.detected_at.split('T')[0]}`,
+    `${finalStatus === 'resolved' ? 'Resolved' : 'Acknowledged'}: ${today}`,
+    '',
+    `Description: ${afterRow.conflict_description}`,
+  ]
+  if (afterRow.resolution_notes) {
+    lines.push('', `Resolution: ${afterRow.resolution_notes}`)
+  }
+  lines.push(
+    '',
+    'Decisions:',
+    renderDecision('A', decisionA),
+    renderDecision('B', decisionB),
+  )
+
+  return { content: [{ type: "text", text: lines.join('\n') }] }
 })
 
 server.registerTool('route_query', {
