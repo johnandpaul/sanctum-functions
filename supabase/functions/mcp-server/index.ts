@@ -69,6 +69,25 @@ async function callHaiku(prompt: string, maxTokens = 512): Promise<string> {
   return data.content[0].text
 }
 
+async function callSonnet(prompt: string, maxTokens = 2048): Promise<string> {
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: maxTokens,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  })
+  if (!res.ok) throw new Error(`Sonnet API ${res.status}`)
+  const data = await res.json()
+  return data.content[0].text
+}
+
 type QueryType =
   | 'factual_recall'
   | 'decision_history'
@@ -735,6 +754,274 @@ Summary: ${JSON.stringify(summary)}`
     // Non-fatal — skip question bank update for this session
     return []
   }
+}
+
+// ─── Synthesize thinking on topic (Component 12) ─────────────────────────
+
+interface TimelineEntry {
+  date: string          // YYYY-MM-DD
+  kind: 'note' | 'decision' | 'related'
+  render: string
+  source_path?: string
+  source_id?: string
+}
+
+interface SynthesisResult {
+  topic: string
+  project: string | null
+  since: string | null
+  narrative: string
+  timeline_start: string | null
+  timeline_end: string | null
+  source_count: { notes: number; decisions: number; related: number }
+  note_sources: string[]
+  decision_matched: boolean
+  synthesis_error?: string
+}
+
+async function internalSynthesizeThinking(
+  topic: string,
+  project: string | null,
+  since: string | null,
+): Promise<SynthesisResult> {
+  // ── Phase A: parallel retrieval ─────────────────────────────────────
+  const [semanticHits, decisionHistory] = await Promise.all([
+    internalSemanticSearch(topic, 10, project),
+    internalGetDecisionHistory(topic, project, 5),
+  ])
+
+  // ── Phase B: fetch note metadata for semantic-hit paths ─────────────
+  const noteMetaByPath = new Map<string, {
+    id: string
+    path: string
+    title: string | null
+    date: string | null
+  }>()
+
+  if (semanticHits.length > 0) {
+    const { data: noteRows } = await supabase
+      .from('notes')
+      .select('id, path, title, created_at, updated_at')
+      .in('path', semanticHits.map(s => s.path))
+    for (const n of (noteRows ?? []) as Array<{ id: string; path: string; title: string | null; created_at: string | null; updated_at: string | null }>) {
+      const updated = n.updated_at ? n.updated_at.split('T')[0] : null
+      noteMetaByPath.set(n.path, {
+        id: n.id,
+        path: n.path,
+        title: n.title,
+        date: updated ?? n.created_at ?? null,
+      })
+    }
+  }
+
+  // ── Phase C: parallel edge expansion from top 5 semantic seeds ──────
+  const seedIds = semanticHits
+    .slice(0, 5)
+    .map(s => noteMetaByPath.get(s.path)?.id)
+    .filter((x): x is string => !!x)
+
+  const relatedBySeeder = await Promise.all(
+    seedIds.map(id => internalGetRelatedNotes(id, 'auto', 5))
+  )
+
+  const semanticPathSet = new Set(semanticHits.map(s => s.path))
+  const relatedSeen = new Set<string>()
+  const relatedEntries: Array<{
+    related_id: string
+    related_path: string
+    related_title: string | null
+    relationship_type: string
+  }> = []
+  for (const bucket of relatedBySeeder) {
+    for (const r of bucket) {
+      if (semanticPathSet.has(r.related_path)) continue
+      if (relatedSeen.has(r.related_path)) continue
+      relatedSeen.add(r.related_path)
+      relatedEntries.push({
+        related_id: r.related_id,
+        related_path: r.related_path,
+        related_title: r.related_title,
+        relationship_type: r.relationship_type,
+      })
+    }
+  }
+
+  const relatedDateById = new Map<string, string | null>()
+  if (relatedEntries.length > 0) {
+    const { data: rows } = await supabase
+      .from('notes')
+      .select('id, created_at, updated_at')
+      .in('id', relatedEntries.map(r => r.related_id))
+    for (const n of (rows ?? []) as Array<{ id: string; created_at: string | null; updated_at: string | null }>) {
+      const updated = n.updated_at ? n.updated_at.split('T')[0] : null
+      relatedDateById.set(n.id, updated ?? n.created_at ?? null)
+    }
+  }
+
+  // ── Phase D: build timeline entries ─────────────────────────────────
+  const timeline: TimelineEntry[] = []
+
+  for (const hit of semanticHits) {
+    const meta = noteMetaByPath.get(hit.path)
+    const date = meta?.date
+    if (!date) continue
+    const title = meta?.title ?? hit.path
+    const excerpt = hit.content.slice(0, 300).replace(/\s+/g, ' ').trim()
+    timeline.push({
+      date,
+      kind: 'note',
+      source_path: hit.path,
+      render: `[${date} | note]           ${hit.path} — ${title}\n  excerpt: ${excerpt}...`,
+    })
+  }
+
+  for (const chain of decisionHistory.chains) {
+    for (const d of chain.decisions) {
+      const date = d.decided_at
+      if (!date) continue
+      const statusPart = d.status === 'superseded' && d.superseded_by
+        ? `superseded_by ${d.superseded_by.slice(0, 8)}${d.superseded_reason ? ` (reason: ${d.superseded_reason})` : ''}`
+        : d.status
+      const lines = [
+        `[${date} | decision]       ${statusPart}`,
+        `  "${d.decision_text}"`,
+        `  id: ${d.id.slice(0, 8)}`,
+      ]
+      if (d.outcome_notes && d.status !== 'active') {
+        lines.push(`  outcome: ${d.outcome_notes}`)
+      }
+      timeline.push({
+        date,
+        kind: 'decision',
+        source_id: d.id,
+        render: lines.join('\n'),
+      })
+    }
+  }
+
+  for (const r of relatedEntries) {
+    const date = relatedDateById.get(r.related_id)
+    if (!date) continue
+    const title = r.related_title ?? r.related_path
+    timeline.push({
+      date,
+      kind: 'related',
+      source_path: r.related_path,
+      render: `[${date} | related]        via "${r.relationship_type}"\n  ${r.related_path} — ${title}`,
+    })
+  }
+
+  // ── Phase E: dedupe ─────────────────────────────────────────────────
+  const seenPath = new Set<string>()
+  const seenDecisionId = new Set<string>()
+  const deduped: TimelineEntry[] = []
+  for (const entry of timeline) {
+    if (entry.kind === 'decision' && entry.source_id) {
+      if (seenDecisionId.has(entry.source_id)) continue
+      seenDecisionId.add(entry.source_id)
+    } else if (entry.source_path) {
+      if (seenPath.has(entry.source_path)) continue
+      seenPath.add(entry.source_path)
+    }
+    deduped.push(entry)
+  }
+
+  // ── Phase F: since filter + chronological sort ──────────────────────
+  const filtered = since
+    ? deduped.filter(e => e.date >= since)
+    : deduped
+  filtered.sort((a, b) => a.date.localeCompare(b.date))
+
+  // ── Phase G: empty check (hardcoded, no Sonnet call) ────────────────
+  const noteCount = filtered.filter(e => e.kind === 'note').length
+  const decisionCount = filtered.filter(e => e.kind === 'decision').length
+  const relatedCount = filtered.filter(e => e.kind === 'related').length
+
+  if (filtered.length === 0) {
+    return {
+      topic,
+      project,
+      since,
+      narrative: `No relevant thinking found on "${topic}"${project ? ` in project ${project}` : ''}${since ? ` since ${since}` : ''}. No notes, decisions, or related knowledge-graph edges matched.`,
+      timeline_start: null,
+      timeline_end: null,
+      source_count: { notes: 0, decisions: 0, related: 0 },
+      note_sources: [],
+      decision_matched: false,
+    }
+  }
+
+  // ── Phase H: call Sonnet ────────────────────────────────────────────
+  const timelineDump = filtered.map(e => e.render).join('\n\n')
+
+  const prompt = `You are synthesizing how John's thinking on "${topic}" has evolved over time.
+
+Below is a chronological timeline of notes he wrote, decisions he recorded, and related notes surfaced from his knowledge graph. Each entry is timestamped.
+
+Write a 3-5 paragraph narrative that:
+1. Opens with when this thinking started and what the initial position was.
+2. Traces the key shifts in position over time, citing specific dates.
+3. Calls out decisions that were superseded, proven, disproven, or abandoned — and what changed his mind (use the "reason:" hint when present).
+4. Ends with the current settled position, OR identifies the remaining unresolved tension if there isn't one.
+5. Keeps it grounded — do NOT invent facts or decisions that aren't in the timeline. If the timeline is sparse, say so explicitly.
+
+Respond with ONLY the narrative text. No headers, no bullet lists, no code fences.
+
+--- TIMELINE ---
+${timelineDump}
+--- END TIMELINE ---`
+
+  let narrative = ''
+  let synthesis_error: string | undefined
+
+  try {
+    narrative = (await callSonnet(prompt, 2048)).trim()
+  } catch (err) {
+    synthesis_error = `synthesis failed: ${(err as Error).message}`
+    narrative = `⚠️ Sonnet synthesis failed. Raw timeline below:\n\n${timelineDump}`
+  }
+
+  // ── Phase I: build result ───────────────────────────────────────────
+  const noteSources = Array.from(new Set(
+    filtered
+      .filter(e => e.source_path && (e.kind === 'note' || e.kind === 'related'))
+      .map(e => e.source_path!)
+  ))
+
+  return {
+    topic,
+    project,
+    since,
+    narrative,
+    timeline_start: filtered[0].date,
+    timeline_end: filtered[filtered.length - 1].date,
+    source_count: { notes: noteCount, decisions: decisionCount, related: relatedCount },
+    note_sources: noteSources,
+    decision_matched: decisionCount > 0,
+    synthesis_error,
+  }
+}
+
+function formatSynthesis(result: SynthesisResult): string {
+  const lines: string[] = [`# Thinking on: ${result.topic}`]
+  if (result.project) lines.push(`Project: ${result.project}`)
+  if (result.since) lines.push(`Since: ${result.since}`)
+
+  if (result.timeline_start && result.timeline_end) {
+    lines.push(`📅 Timeline: ${result.timeline_start} → ${result.timeline_end}`)
+  }
+  lines.push(`📊 Sources: ${result.source_count.notes} notes, ${result.source_count.decisions} decisions, ${result.source_count.related} related`)
+  if (result.synthesis_error) lines.push(`⚠️ ${result.synthesis_error}`)
+
+  lines.push('', result.narrative)
+
+  if (result.note_sources.length > 0) {
+    lines.push('', '## Sources')
+    for (const p of result.note_sources) lines.push(`📄 ${p}`)
+    if (result.decision_matched) lines.push(`🎯 Decision chain matched on topic keywords`)
+  }
+
+  return lines.join('\n')
 }
 
 const app = new Hono()
@@ -3399,6 +3686,19 @@ server.registerTool('close_session', {
   return { content: [{ type: "text", text: lines.join('\n') }] }
 })
 
+server.registerTool('synthesize_thinking_on', {
+  title: 'Synthesize Thinking On',
+  description: "Produces a 3-5 paragraph narrative of how John's thinking on a topic has evolved over time. Traverses semantic search results, decision history chains (with supersession walks), and knowledge graph edges; merges them into a chronological timeline; then uses Claude Sonnet to synthesize a reasoning arc — not a list. Cites specific dates, calls out superseded decisions with their reasons, and identifies the current settled position or unresolved tension. Use for 'tell me everything about X', 'how has my thinking on Y evolved', or any exploratory synthesis query. This is the oracle capability — a story of reasoning, not a retrieval. Note: route_query auto-routes exploratory_synthesis queries here.",
+  inputSchema: {
+    topic: z.string().describe("The subject to synthesize thinking on, e.g. 'sono pricing', 'backup strategy', 'supabase vs n8n'"),
+    project: z.string().optional().describe("Optional project filter: sigyls, sanctum, sono, dallas-tub-fix, turnkey, iconic-roofing"),
+    since: z.string().optional().describe("Optional ISO date YYYY-MM-DD — only include thinking from this date forward. Useful for 'how has this evolved since March' queries."),
+  },
+}, async ({ topic, project, since }) => {
+  const result = await internalSynthesizeThinking(topic, project ?? null, since ?? null)
+  return { content: [{ type: "text", text: formatSynthesis(result) }] }
+})
+
 server.registerTool('route_query', {
   title: 'Route Query (Smart Search)',
   description: "PREFERRED TOOL for any natural language question about John's vault. Always try this FIRST for questions like 'what did I decide about X', 'how should I approach Y', 'what's the status of Z', 'what do I know about...', or any conceptual/exploratory query. Classifies query intent using Haiku, then automatically routes to the optimal retrieval strategy (semantic search, decision history, entity lookup, current status, synthesis, or cross-project insight). Includes dead-end memory check for 'how should I approach X' questions. Only fall back to search_vault or semantic_search if route_query returns no useful results.",
@@ -3445,18 +3745,20 @@ server.registerTool('route_query', {
   let body = ''
 
   switch (query_type) {
+    case 'exploratory_synthesis': {
+      const syn = await internalSynthesizeThinking(topic || query, project ?? null, null)
+      body = formatSynthesis(syn)
+      break
+    }
+
     case 'factual_recall':
-    case 'exploratory_synthesis':
     case 'approach_recommendation': {
       const results = await internalSemanticSearch(topic || query, 5, project)
       if (!results.length) {
         body = `No semantic search results for: ${topic || query}`
         break
       }
-      const label = query_type === 'exploratory_synthesis'
-        ? '## Relevant notes (full synthesis coming in Phase 4 via synthesize_thinking_on)'
-        : '## Relevant notes'
-      body = `${label}\n` + results.map(r =>
+      body = `## Relevant notes\n` + results.map(r =>
         `📄 ${r.path} (${Math.round(r.similarity * 100)}% match)\n${r.content.slice(0, 200)}...`
       ).join('\n\n')
       break
