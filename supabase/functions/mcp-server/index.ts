@@ -157,6 +157,199 @@ async function internalSemanticSearch(
   return (data.results ?? []) as Array<{ path: string; similarity: number; content: string }>
 }
 
+// ─── Decision history (Component 13) ─────────────────────────────────────
+
+interface DecisionRow {
+  id: string
+  note_id: string | null
+  decision_text: string
+  project: string | null
+  decided_at: string
+  status: 'active' | 'superseded' | 'proven' | 'disproven' | 'abandoned'
+  superseded_by: string | null
+  superseded_at: string | null
+  superseded_reason: string | null
+  outcome_notes: string | null
+  tags: string[] | null
+  provenance_type: string | null
+}
+
+interface DecisionChain {
+  decisions: DecisionRow[]
+  tip: DecisionRow
+  projects: string[]
+  matched_ids: Set<string>
+}
+
+interface DecisionHistoryResult {
+  topic: string
+  project: string | null
+  chains: DecisionChain[]
+  total_matched: number
+}
+
+const DECISION_COLUMNS =
+  'id, note_id, decision_text, project, decided_at, status, superseded_by, superseded_at, superseded_reason, outcome_notes, tags, provenance_type'
+
+async function internalGetDecisionHistory(
+  topic: string,
+  project: string | null = null,
+  limit = 5,
+): Promise<DecisionHistoryResult> {
+  // ─── 1. Match phase: ILIKE on decision_text + tag overlap ──────────────
+  const tagTokens = topic.toLowerCase().split(/\s+/).filter(Boolean)
+
+  let byTextQ = supabase
+    .from('decisions')
+    .select(DECISION_COLUMNS)
+    .ilike('decision_text', `%${topic}%`)
+    .limit(20)
+  if (project) byTextQ = byTextQ.eq('project', project)
+
+  let byTagQ = supabase
+    .from('decisions')
+    .select(DECISION_COLUMNS)
+    .overlaps('tags', tagTokens)
+    .limit(20)
+  if (project) byTagQ = byTagQ.eq('project', project)
+
+  const [byTextRes, byTagRes] = await Promise.all([byTextQ, byTagQ])
+
+  const allDecisions = new Map<string, DecisionRow>()
+  for (const row of (byTextRes.data ?? []) as DecisionRow[]) allDecisions.set(row.id, row)
+  for (const row of (byTagRes.data ?? []) as DecisionRow[]) allDecisions.set(row.id, row)
+
+  if (allDecisions.size === 0) {
+    return { topic, project, chains: [], total_matched: 0 }
+  }
+
+  const matchedIds = new Set(allDecisions.keys())
+
+  // ─── 2. Walk phase: BFS outward via superseded_by, bounded depth=5 ─────
+  let frontierIds = new Set(allDecisions.keys())
+  for (let depth = 0; depth < 5 && frontierIds.size > 0; depth++) {
+    const frontierList = [...frontierIds]
+
+    // Forward successors: follow superseded_by pointers we haven't loaded yet
+    const successorIds = frontierList
+      .map(id => allDecisions.get(id)?.superseded_by)
+      .filter((x): x is string => !!x && !allDecisions.has(x))
+
+    const queries: Array<Promise<{ data: DecisionRow[] | null }>> = []
+    if (successorIds.length > 0) {
+      queries.push(
+        supabase.from('decisions').select(DECISION_COLUMNS).in('id', successorIds) as any
+      )
+    }
+    // Backward predecessors: rows whose superseded_by IN frontier
+    queries.push(
+      supabase.from('decisions').select(DECISION_COLUMNS).in('superseded_by', frontierList) as any
+    )
+
+    const results = await Promise.all(queries)
+    const newIds = new Set<string>()
+    for (const res of results) {
+      for (const row of (res.data ?? [])) {
+        if (!allDecisions.has(row.id)) {
+          allDecisions.set(row.id, row)
+          newIds.add(row.id)
+        }
+      }
+    }
+    frontierIds = newIds
+  }
+
+  // ─── 3. Group into chains via union-find on superseded_by edges ────────
+  const parent = new Map<string, string>()
+  const findRoot = (x: string): string => {
+    while (parent.get(x) !== x) x = parent.get(x)!
+    return x
+  }
+  for (const id of allDecisions.keys()) parent.set(id, id)
+  for (const [id, d] of allDecisions) {
+    if (d.superseded_by && allDecisions.has(d.superseded_by)) {
+      const ra = findRoot(id)
+      const rb = findRoot(d.superseded_by)
+      if (ra !== rb) parent.set(ra, rb)
+    }
+  }
+
+  const chainByRoot = new Map<string, DecisionRow[]>()
+  for (const [id, d] of allDecisions) {
+    const root = findRoot(id)
+    const list = chainByRoot.get(root) ?? []
+    list.push(d)
+    chainByRoot.set(root, list)
+  }
+
+  // ─── 4. Sort each chain by decided_at ASC, identify tip + metadata ─────
+  const chains: DecisionChain[] = []
+  for (const decisions of chainByRoot.values()) {
+    decisions.sort((a, b) => a.decided_at.localeCompare(b.decided_at))
+    const tip = decisions[decisions.length - 1]
+    const projects = [...new Set(decisions.map(d => d.project).filter((p): p is string => !!p))]
+    const chain_matched = new Set(decisions.filter(d => matchedIds.has(d.id)).map(d => d.id))
+    chains.push({ decisions, tip, projects, matched_ids: chain_matched })
+  }
+
+  // ─── 5. Sort chains by tip decided_at DESC, cap at limit ───────────────
+  chains.sort((a, b) => b.tip.decided_at.localeCompare(a.tip.decided_at))
+  return {
+    topic,
+    project,
+    chains: chains.slice(0, limit),
+    total_matched: matchedIds.size,
+  }
+}
+
+function formatDecisionHistory(result: DecisionHistoryResult): string {
+  const { topic, project, chains, total_matched } = result
+
+  if (chains.length === 0) {
+    return `# Decision history — "${topic}"\n\nNo decisions found${project ? ` for project ${project}` : ''}.`
+  }
+
+  const truncate = (s: string, n: number) => s.length <= n ? s : s.slice(0, n - 1) + '…'
+
+  const header =
+    `# Decision history — "${topic}"\n` +
+    (project ? `Project: ${project} | ` : '') +
+    `${chains.length} chain${chains.length > 1 ? 's' : ''} · ${total_matched} matched decision${total_matched > 1 ? 's' : ''}`
+
+  const chainBlocks = chains.map((chain, i) => {
+    const tipLabel = chain.tip.status === 'active' ? 'current' : chain.tip.status
+    const projectLabel =
+      chain.projects.length === 1 ? chain.projects[0] :
+      chain.projects.length > 1 ? `multi (${chain.projects.join(', ')})` :
+      '(no project)'
+    const n = chain.decisions.length
+    const chainHeader = `## Chain ${i + 1} — ${projectLabel} (${n} decision${n > 1 ? 's' : ''}, ${tipLabel}: ${truncate(chain.tip.decision_text, 60)})`
+
+    const lines = chain.decisions.map((d, j) => {
+      const isTip = j === chain.decisions.length - 1
+      const matchMarker = chain.matched_ids.has(d.id) ? ' ★' : ''
+      const currentMarker = isTip && d.status === 'active' ? '  ← CURRENT' : ''
+      const headLine = `${j + 1}. [${d.decided_at} | ${d.status}]${matchMarker} ${d.decision_text}${currentMarker}`
+
+      const extras: string[] = []
+      if (d.superseded_by && d.superseded_at) {
+        const prov = d.provenance_type ? ` · ${d.provenance_type}` : ''
+        const reason = d.superseded_reason ? ` — "${d.superseded_reason}"` : ''
+        extras.push(`   ↓ ${d.superseded_at}${prov}${reason}`)
+      }
+      if (d.outcome_notes && (d.status === 'proven' || d.status === 'disproven' || d.status === 'abandoned')) {
+        extras.push(`   outcome: ${d.outcome_notes}`)
+      }
+
+      return [headLine, ...extras].join('\n')
+    }).join('\n\n')
+
+    return `${chainHeader}\n\n${lines}`
+  }).join('\n\n')
+
+  return `${header}\n\n${chainBlocks}`
+}
+
 const app = new Hono()
 const server = new McpServer({ name: 'sanctum-vault', version: '1.0.0' })
 
@@ -2347,6 +2540,19 @@ server.registerTool('debug_folder_list', {
   };
 });
 
+server.registerTool('get_decision_history', {
+  title: 'Get Decision History',
+  description: "Get the full history of decisions John has made on a topic. Walks the supersession chain from each matched decision through to its current state and back to its origin. Returns a compact visualization of each decision chain with dates, status transitions, and provenance (why decisions changed). Use when the user asks 'what did I decide about X', 'how has my thinking on Y evolved', or 'what's the history of Z decision'. Note: route_query automatically delegates decision_history queries here — prefer route_query for natural language questions.",
+  inputSchema: {
+    topic: z.string().describe("The subject to get decision history for (e.g. 'backup strategy', 'auth flow')"),
+    project: z.string().optional().describe("Optional project filter: sigyls, sanctum, sono, dallas-tub-fix, turnkey, iconic-roofing"),
+    limit: z.number().optional().describe("Max chains to return, default 5"),
+  },
+}, async ({ topic, project, limit }) => {
+  const result = await internalGetDecisionHistory(topic, project ?? null, limit ?? 5)
+  return { content: [{ type: "text", text: formatDecisionHistory(result) }] }
+})
+
 server.registerTool('route_query', {
   title: 'Route Query (Smart Search)',
   description: "PREFERRED TOOL for any natural language question about John's vault. Always try this FIRST for questions like 'what did I decide about X', 'how should I approach Y', 'what's the status of Z', 'what do I know about...', or any conceptual/exploratory query. Classifies query intent using Haiku, then automatically routes to the optimal retrieval strategy (semantic search, decision history, entity lookup, current status, synthesis, or cross-project insight). Includes dead-end memory check for 'how should I approach X' questions. Only fall back to search_vault or semantic_search if route_query returns no useful results.",
@@ -2411,11 +2617,8 @@ server.registerTool('route_query', {
     }
 
     case 'decision_history': {
-      body = `⚠️ get_decision_history() not yet built (Phase 3 C13 pending).\n   Falling back to semantic search.\n\n`
-      const results = await internalSemanticSearch(topic || query, 5, project)
-      body += results.length
-        ? results.map(r => `📄 ${r.path} (${Math.round(r.similarity * 100)}% match)\n${r.content.slice(0, 200)}...`).join('\n\n')
-        : `(no results)`
+      const historyResult = await internalGetDecisionHistory(topic || query, project ?? null, 5)
+      body = formatDecisionHistory(historyResult)
       break
     }
 
