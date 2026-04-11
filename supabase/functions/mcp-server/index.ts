@@ -1621,6 +1621,316 @@ function formatDailyBriefing(result: DailyBriefingResult): string {
   return lines.join('\n')
 }
 
+// ─── Sync edges to wikilinks (Component 15) ───────────────────────────────
+
+const EDGE_SYNC_CAP = 10000
+
+interface SyncEdgesNoteAction {
+  note_id: string
+  path: string
+  links_added: Array<{ target: string; relationship_type: string; confidence: number }>
+  action: 'updated' | 'skipped_no_changes' | 'would_update' | 'failed'
+  error?: string
+}
+
+interface SyncEdgesResult {
+  confidence_min: number
+  dry_run: boolean
+  edges_fetched: number
+  notes_touched: number
+  notes_updated: number
+  notes_skipped: number
+  notes_failed: number
+  links_added_total: number
+  per_note: SyncEdgesNoteAction[]
+  warnings: string[]
+}
+
+function normalizeWikilinkTarget(raw: string): string {
+  return raw
+    .trim()
+    .replace(/\.md$/i, '')
+    .replace(/\\/g, '/')
+    .replace(/^\/+|\/+$/g, '')
+    .toLowerCase()
+}
+
+function extractExistingWikilinks(body: string): Set<string> {
+  const set = new Set<string>()
+  const re = /\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]+)?\]\]/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(body)) !== null) {
+    set.add(normalizeWikilinkTarget(m[1]))
+  }
+  return set
+}
+
+function insertAutoLinkedEntries(body: string, entries: string[]): string {
+  if (entries.length === 0) return body
+
+  const lines = body.split('\n')
+  const headingRegex = /^##\s+Auto-linked\s*$/
+  let headingIdx = -1
+  for (let i = 0; i < lines.length; i++) {
+    if (headingRegex.test(lines[i])) {
+      headingIdx = i
+      break
+    }
+  }
+
+  if (headingIdx === -1) {
+    const trimmed = body.replace(/\n+$/, '')
+    return trimmed + '\n\n## Auto-linked\n' + entries.join('\n') + '\n'
+  }
+
+  let sectionEnd = lines.length
+  for (let i = headingIdx + 1; i < lines.length; i++) {
+    if (/^##\s/.test(lines[i])) {
+      sectionEnd = i
+      break
+    }
+  }
+
+  let insertAt = sectionEnd
+  while (insertAt > headingIdx + 1 && lines[insertAt - 1].trim() === '') {
+    insertAt--
+  }
+
+  const before = lines.slice(0, insertAt)
+  const after = lines.slice(insertAt)
+  return [...before, ...entries, ...after].join('\n')
+}
+
+async function internalSyncEdgesToWikilinks(
+  dry_run: boolean = false,
+  confidence_min: number = 0.75,
+): Promise<SyncEdgesResult> {
+  const warnings: string[] = []
+  const per_note: SyncEdgesNoteAction[] = []
+
+  // Phase 1: fetch edges
+  const { data: edgeRows, error: edgeErr } = await supabase
+    .from('note_edges')
+    .select('id, note_id_a, note_id_b, relationship_type, confidence')
+    .gt('confidence', confidence_min)
+    .order('confidence', { ascending: false })
+    .limit(EDGE_SYNC_CAP)
+
+  if (edgeErr) {
+    warnings.push(`edge fetch failed: ${edgeErr.message}`)
+    return {
+      confidence_min, dry_run, edges_fetched: 0,
+      notes_touched: 0, notes_updated: 0, notes_skipped: 0, notes_failed: 0,
+      links_added_total: 0, per_note, warnings,
+    }
+  }
+
+  const edges = (edgeRows ?? []) as Array<{
+    id: string
+    note_id_a: string
+    note_id_b: string
+    relationship_type: string
+    confidence: number
+  }>
+
+  if (edges.length >= EDGE_SYNC_CAP) {
+    warnings.push(`edge cap hit: ${EDGE_SYNC_CAP} — some edges may be skipped`)
+  }
+
+  // Phase 2: resolve note paths
+  const noteIds = Array.from(new Set(edges.flatMap(e => [e.note_id_a, e.note_id_b])))
+  const pathById = new Map<string, string>()
+  if (noteIds.length > 0) {
+    const { data: noteRows } = await supabase
+      .from('notes')
+      .select('id, path')
+      .in('id', noteIds)
+    for (const n of (noteRows ?? []) as Array<{ id: string; path: string }>) {
+      pathById.set(n.id, n.path)
+    }
+  }
+
+  const validEdges = edges.filter(e => pathById.has(e.note_id_a) && pathById.has(e.note_id_b))
+  const droppedCount = edges.length - validEdges.length
+  if (droppedCount > 0) {
+    warnings.push(`${droppedCount} edges dropped: endpoint note not in notes table`)
+  }
+
+  // Phase 3: build per-note link sets, collapsing to highest confidence
+  interface ProposedLink {
+    target_path: string
+    relationship_type: string
+    confidence: number
+  }
+  const perNoteLinks = new Map<string, Map<string, ProposedLink>>()
+
+  function addProposed(sourceId: string, targetId: string, rtype: string, conf: number) {
+    const targetPath = pathById.get(targetId)!
+    const normTarget = normalizeWikilinkTarget(targetPath)
+    if (!perNoteLinks.has(sourceId)) perNoteLinks.set(sourceId, new Map())
+    const map = perNoteLinks.get(sourceId)!
+    const existing = map.get(normTarget)
+    if (!existing || conf > existing.confidence) {
+      map.set(normTarget, {
+        target_path: targetPath.replace(/\.md$/i, ''),
+        relationship_type: rtype,
+        confidence: conf,
+      })
+    }
+  }
+
+  for (const e of validEdges) {
+    addProposed(e.note_id_a, e.note_id_b, e.relationship_type, e.confidence)
+    addProposed(e.note_id_b, e.note_id_a, e.relationship_type, e.confidence)
+  }
+
+  const notes_touched = perNoteLinks.size
+
+  // Phase 4: process each note sequentially
+  let notes_updated = 0
+  let notes_skipped = 0
+  let notes_failed = 0
+  let links_added_total = 0
+
+  for (const [noteId, linkMap] of perNoteLinks) {
+    const path = pathById.get(noteId)!
+    const proposedLinks = Array.from(linkMap.values())
+      .sort((a, b) => b.confidence - a.confidence)
+
+    try {
+      const readRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(path)}`, {
+        headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` },
+      })
+      if (!readRes.ok) {
+        notes_failed++
+        per_note.push({
+          note_id: noteId, path, links_added: [],
+          action: 'failed', error: `GET HTTP ${readRes.status}`,
+        })
+        continue
+      }
+      const body = await readRes.text()
+
+      const existingTargets = extractExistingWikilinks(body)
+      const toAdd = proposedLinks.filter(
+        l => !existingTargets.has(normalizeWikilinkTarget(l.target_path))
+      )
+
+      if (toAdd.length === 0) {
+        notes_skipped++
+        per_note.push({
+          note_id: noteId, path, links_added: [],
+          action: 'skipped_no_changes',
+        })
+        continue
+      }
+
+      const entryLines = toAdd.map(l =>
+        `- [[${l.target_path}]] — ${l.relationship_type} (${l.confidence.toFixed(2)})`
+      )
+      const newBody = insertAutoLinkedEntries(body, entryLines)
+
+      if (dry_run) {
+        notes_updated++
+        links_added_total += toAdd.length
+        per_note.push({
+          note_id: noteId, path,
+          links_added: toAdd.map(l => ({
+            target: l.target_path,
+            relationship_type: l.relationship_type,
+            confidence: l.confidence,
+          })),
+          action: 'would_update',
+        })
+        continue
+      }
+
+      const writeRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(path)}`, {
+        method: 'PUT',
+        headers: {
+          "Authorization": `Bearer ${OBSIDIAN_API_KEY}`,
+          "Content-Type": "text/markdown",
+        },
+        body: newBody,
+      })
+      if (!writeRes.ok) {
+        notes_failed++
+        per_note.push({
+          note_id: noteId, path, links_added: [],
+          action: 'failed', error: `PUT HTTP ${writeRes.status}`,
+        })
+        continue
+      }
+
+      notes_updated++
+      links_added_total += toAdd.length
+      per_note.push({
+        note_id: noteId, path,
+        links_added: toAdd.map(l => ({
+          target: l.target_path,
+          relationship_type: l.relationship_type,
+          confidence: l.confidence,
+        })),
+        action: 'updated',
+      })
+    } catch (err) {
+      notes_failed++
+      per_note.push({
+        note_id: noteId, path, links_added: [],
+        action: 'failed', error: (err as Error).message,
+      })
+    }
+  }
+
+  return {
+    confidence_min, dry_run,
+    edges_fetched: edges.length,
+    notes_touched,
+    notes_updated,
+    notes_skipped,
+    notes_failed,
+    links_added_total,
+    per_note,
+    warnings,
+  }
+}
+
+function formatSyncEdgesResult(result: SyncEdgesResult): string {
+  const lines: string[] = ['# Sync edges to wikilinks']
+  lines.push(`${result.dry_run ? 'dry_run: true' : 'dry_run: false'} | confidence > ${result.confidence_min}`)
+  lines.push(`📊 edges fetched: ${result.edges_fetched}`)
+  lines.push(
+    `📊 notes touched: ${result.notes_touched} | ${result.dry_run ? 'would update' : 'updated'}: ${result.notes_updated} | skipped (no changes): ${result.notes_skipped} | failed: ${result.notes_failed}`
+  )
+  lines.push(`📊 links ${result.dry_run ? 'would add' : 'added'}: ${result.links_added_total}`)
+
+  const updated = result.per_note.filter(p => p.action === 'updated' || p.action === 'would_update')
+  if (updated.length > 0) {
+    lines.push('', `## ${result.dry_run ? 'Would update' : 'Updates'}`)
+    for (const p of updated) {
+      lines.push(`📝 ${p.path} (+${p.links_added.length} links)`)
+      for (const l of p.links_added) {
+        lines.push(`   - [[${l.target}]] — ${l.relationship_type} (${l.confidence.toFixed(2)})`)
+      }
+    }
+  }
+
+  const failed = result.per_note.filter(p => p.action === 'failed')
+  if (failed.length > 0) {
+    lines.push('', '## Failed')
+    for (const p of failed) {
+      lines.push(`❌ ${p.path} — ${p.error ?? 'unknown'}`)
+    }
+  }
+
+  if (result.warnings.length > 0) {
+    lines.push('', '## Warnings')
+    for (const w of result.warnings) lines.push(`• ${w}`)
+  }
+
+  return lines.join('\n')
+}
+
 const app = new Hono()
 const server = new McpServer({ name: 'sanctum-vault', version: '1.0.0' })
 
@@ -4323,6 +4633,18 @@ server.registerTool('generate_daily_briefing', {
   return { content: [{ type: "text", text: formatDailyBriefing(result) }] }
 })
 
+server.registerTool('sync_edges_to_wikilinks', {
+  title: 'Sync Edges to Wikilinks',
+  description: "Writes high-confidence note_edges (> 0.75, the C25 auto-surface tier) back into Obsidian notes as wikilinks under a `## Auto-linked` section. Bidirectional: an edge A↔B writes a wikilink in both notes. Additive only — never removes existing wikilinks, never touches prose. Deduplicates against any existing wikilink in the note body. Run after extraction to keep Obsidian graph view in sync with the knowledge graph in Supabase. Requires Obsidian vault online (Local REST API).",
+  inputSchema: {
+    dry_run: z.boolean().optional().describe("If true, compute all edits but skip PUT. Default false."),
+    confidence_min: z.number().optional().describe("Edge confidence cutoff, exclusive (edge.confidence > this). Default 0.75 (C25 auto-surface tier)."),
+  },
+}, async ({ dry_run, confidence_min }) => {
+  const result = await internalSyncEdgesToWikilinks(dry_run ?? false, confidence_min ?? 0.75)
+  return { content: [{ type: 'text', text: formatSyncEdgesResult(result) }] }
+})
+
 server.registerTool('route_query', {
   title: 'Route Query (Smart Search)',
   description: "PREFERRED TOOL for any natural language question about John's vault. Always try this FIRST for questions like 'what did I decide about X', 'how should I approach Y', 'what's the status of Z', 'what do I know about...', or any conceptual/exploratory query. Classifies query intent using Haiku, then automatically routes to the optimal retrieval strategy (semantic search, decision history, entity lookup, current status, synthesis, or cross-project insight). Includes dead-end memory check for 'how should I approach X' questions. Only fall back to search_vault or semantic_search if route_query returns no useful results.",
@@ -4568,6 +4890,24 @@ app.get('/cron/daily-briefing', async (c) => {
       recurring_questions: result.recurring_questions.length,
       cross_project_edges: result.cross_project.edge_count,
       hot_context_written: result.hot_context_written,
+      warnings: result.warnings,
+    })
+  } catch (err) {
+    return c.json({ ok: false, error: String(err) }, 500)
+  }
+})
+
+app.get('/cron/sync-edges-to-wikilinks', async (c) => {
+  try {
+    const result = await internalSyncEdgesToWikilinks(false, 0.75)
+    return c.json({
+      ok: true,
+      edges_fetched: result.edges_fetched,
+      notes_touched: result.notes_touched,
+      notes_updated: result.notes_updated,
+      notes_skipped: result.notes_skipped,
+      notes_failed: result.notes_failed,
+      links_added: result.links_added_total,
       warnings: result.warnings,
     })
   } catch (err) {
