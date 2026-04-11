@@ -1996,11 +1996,23 @@ server.registerTool('get_youtube_transcript', {
 
 server.registerTool('load_session_context', {
   title: 'Load Session Context',
-  description: "Load full session context from the vault manifest. Called at the start of any session with 'load context' or 'load context [project]'. Returns base orientation notes, all project briefs, and optionally deep-reference notes for a specific project.",
+  description: "Load full session context: vault manifest (base orientation + optional project deep-load) plus Phase 1/2 knowledge tables (hot_context, session_log, decisions, recurring_questions). Called at the start of any session with 'load context' or 'load context [project]'. Performs TTL eviction on expired hot_context rows before serving. Returns base orientation, hot context, last session summary, open threads, recent decisions, flagged conflicts, recurring questions, all project briefs, and — when a project is given — project deep-load notes plus dead-end memory for that project.",
   inputSchema: {
-    project: z.string().optional().describe("Optional project name for deep-loading: sigyls, turnkey, dallas-tub-fix, sanctum, sono")
+    project: z.string().optional().describe("Optional project name for deep-loading: sigyls, turnkey, dallas-tub-fix, sanctum, sono, iconic-roofing")
   }
 }, async ({ project }) => {
+  const today = new Date().toISOString().split('T')[0]
+  const nowIso = new Date().toISOString()
+  const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+
+  // ─── TTL eviction (schema contract: clean before serving) ───────────────
+  await supabase
+    .from('hot_context')
+    .delete()
+    .not('expires_at', 'is', null)
+    .lt('expires_at', nowIso)
+
+  // ─── Manifest fetch (file-based, unchanged) ─────────────────────────────
   const manifestPath = '00-system/context-manifest.md'
   const manifestRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(manifestPath)}`, {
     headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
@@ -2033,28 +2045,145 @@ server.registerTool('load_session_context', {
 
   const basePaths = parseManifestSection(manifestContent, 'base')
   const projectPaths = project ? parseManifestSection(manifestContent, project) : []
-  const allPaths = [...basePaths, ...projectPaths]
 
-  const noteResults = await Promise.all(
-    allPaths.map(async (notePath) => {
-      const res = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(notePath)}`, {
-        headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
-      })
-      let text: string
-      if (!res.ok) {
-        const githubText = await readNoteFromGitHub(notePath)
-        if (!githubText) return `\n\n---\n⚠️ Could not load: ${notePath}\n---`
-        text = githubText + '\n*(via GitHub fallback)*'
-      } else {
-        text = await res.text()
-      }
-      return `\n\n---\n## ${notePath}\n\n${text}`
+  async function fetchManifestNote(notePath: string): Promise<string> {
+    const res = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(notePath)}`, {
+      headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
     })
-  )
+    if (!res.ok) {
+      const githubText = await readNoteFromGitHub(notePath)
+      if (!githubText) return `\n\n---\n⚠️ Could not load: ${notePath}\n---`
+      return `\n\n---\n## ${notePath}\n\n${githubText}\n*(via GitHub fallback)*`
+    }
+    return `\n\n---\n## ${notePath}\n\n${await res.text()}`
+  }
 
   const allProjects = ['dallas-tub-fix', 'sigyls', 'sanctum', 'sono', 'turnkey', 'iconic-roofing']
-  const briefResults = await Promise.all(
-    allProjects.map(async (proj) => {
+
+  // ─── Fire everything in parallel ────────────────────────────────────────
+  const [
+    hotContextRows,
+    lastSessionRows,
+    recentThreadRows,
+    decisionRows,
+    conflictRows,
+    questionRows,
+    deadEndHits,
+    baseNotes,
+    projectDeepLoadNotes,
+    briefResults,
+  ] = await Promise.all([
+    // 1. hot_context (post-eviction, no expires filter needed)
+    (async () => {
+      let q = supabase
+        .from('hot_context')
+        .select('context_type, project, content, relevance_score')
+        .order('relevance_score', { ascending: false })
+        .limit(15)
+      if (project) q = q.or(`project.eq.${project},project.is.null`)
+      const { data } = await q
+      return data ?? []
+    })(),
+
+    // 2. last session (scoped by project if given)
+    (async () => {
+      let q = supabase
+        .from('session_log')
+        .select('session_date, projects_touched, summary, open_threads, decisions_made')
+        .order('session_date', { ascending: false })
+        .limit(1)
+      if (project) q = q.contains('projects_touched', [project])
+      const { data } = await q
+      return data ?? []
+    })(),
+
+    // 3. open threads — pull last 5 sessions, union + dedupe in code
+    (async () => {
+      let q = supabase
+        .from('session_log')
+        .select('open_threads, session_date')
+        .order('session_date', { ascending: false })
+        .limit(5)
+      if (project) q = q.contains('projects_touched', [project])
+      const { data } = await q
+      return data ?? []
+    })(),
+
+    // 4. recent decisions (last 7 days, status=active)
+    (async () => {
+      let q = supabase
+        .from('decisions')
+        .select('decision_text, project, decided_at')
+        .eq('status', 'active')
+        .gte('decided_at', sevenDaysAgo)
+        .order('decided_at', { ascending: false })
+        .limit(10)
+      if (project) q = q.eq('project', project)
+      const { data } = await q
+      return data ?? []
+    })(),
+
+    // 5. flagged conflicts — urgency decay computed post-query
+    (async () => {
+      let q = supabase
+        .from('hot_context')
+        .select('content, project, created_at')
+        .eq('context_type', 'flagged_conflict')
+        .limit(20)
+      if (project) q = q.or(`project.eq.${project},project.is.null`)
+      const { data } = await q
+      return data ?? []
+    })(),
+
+    // 6. recurring questions (status=open, ask_count >= 3)
+    (async () => {
+      let q = supabase
+        .from('recurring_questions')
+        .select('question_text, ask_count, last_asked_at, project')
+        .eq('status', 'open')
+        .gte('ask_count', 3)
+        .order('last_asked_at', { ascending: false })
+        .limit(5)
+      if (project) q = q.eq('project', project)
+      const { data } = await q
+      return data ?? []
+    })(),
+
+    // 7. dead-end memory (project only)
+    (async () => {
+      if (!project) return [] as Array<{ session_date: string; approach: string; reason_failed: string }>
+      const { data } = await supabase
+        .from('session_log')
+        .select('session_date, abandoned_approaches')
+        .contains('projects_touched', [project])
+        .order('session_date', { ascending: false })
+        .limit(20)
+      const hits: Array<{ session_date: string; approach: string; reason_failed: string }> = []
+      for (const row of data ?? []) {
+        const arr = Array.isArray((row as any).abandoned_approaches) ? (row as any).abandoned_approaches : []
+        for (const a of arr) {
+          if (a && typeof a === 'object' && (a.project === project || !a.project)) {
+            hits.push({
+              session_date: (row as any).session_date,
+              approach: a.approach ?? '(unspecified)',
+              reason_failed: a.reason_failed ?? '(unknown)',
+            })
+            if (hits.length >= 5) break
+          }
+        }
+        if (hits.length >= 5) break
+      }
+      return hits
+    })(),
+
+    // 8. base orientation notes (from manifest)
+    Promise.all(basePaths.map(fetchManifestNote)),
+
+    // 9. project deep-load notes (from manifest)
+    Promise.all(projectPaths.map(fetchManifestNote)),
+
+    // 10. all 6 project briefs (file-based, unchanged logic)
+    Promise.all(allProjects.map(async (proj) => {
       const folderPath = `01-projects/${proj}`
       const listRes = await fetch(`${OBSIDIAN_API_URL}/vault/${encodedVaultPath(folderPath)}/`, {
         headers: { "Authorization": `Bearer ${OBSIDIAN_API_KEY}` }
@@ -2086,12 +2215,118 @@ server.registerTool('load_session_context', {
         content = await noteRes.text()
       }
       return `\n\n---\n## Project Brief: ${proj}\n📄 ${notePath}\n\n${content}`
-    })
-  )
+    })),
+  ])
 
-  const header = `# Session Context Loaded — ${new Date().toISOString().split('T')[0]}${project ? ` (+ ${project} deep-load)` : ''}\n\nBase notes: ${basePaths.length} | Project deep-load: ${projectPaths.length} | Project briefs: ${allProjects.length}`
+  // ─── Dedupe open threads across last 5 session rows ─────────────────────
+  const openThreads: string[] = (() => {
+    const seen = new Set<string>()
+    const out: string[] = []
+    for (const row of recentThreadRows as any[]) {
+      for (const t of row.open_threads ?? []) {
+        if (!seen.has(t)) { seen.add(t); out.push(t) }
+      }
+    }
+    return out
+  })()
 
-  const fullContext = header + noteResults.join('') + '\n\n---\n# Project Briefs\n' + briefResults.join('')
+  // ─── Score + sort flagged conflicts by urgency decay ────────────────────
+  const scoredConflicts = (conflictRows as any[]).map(c => {
+    const daysOld = c.created_at
+      ? (Date.now() - new Date(c.created_at).getTime()) / (1000 * 60 * 60 * 24)
+      : 0
+    return { ...c, urgency: 1.0 / (1 + daysOld * 0.1) }
+  }).sort((a, b) => b.urgency - a.urgency).slice(0, 10)
+
+  // ─── Format sections ────────────────────────────────────────────────────
+  const hotContextSection = hotContextRows.length
+    ? `## Hot context\n` + (hotContextRows as any[]).map(r =>
+        `- [${r.context_type}${r.project ? `|${r.project}` : ''}] ${r.content}`
+      ).join('\n')
+    : `## Hot context\n(empty)`
+
+  const lastSessionSection = (() => {
+    if (!lastSessionRows.length) return `## Last session${project ? ` — ${project}` : ''}\n(empty)`
+    const row: any = lastSessionRows[0]
+    const meta = `**${row.session_date}**${row.projects_touched?.length ? ` — ${row.projects_touched.join(', ')}` : ''}`
+    const counts = [
+      row.open_threads?.length ? `${row.open_threads.length} open threads` : null,
+      row.decisions_made?.length ? `${row.decisions_made.length} decisions` : null,
+    ].filter(Boolean).join(' · ')
+    return `## Last session${project ? ` — ${project}` : ''}\n${meta}\n${row.summary || '(no summary)'}${counts ? `\n_${counts}_` : ''}`
+  })()
+
+  const openThreadsSection = openThreads.length
+    ? `## Open threads\n` + openThreads.map(t => `- ${t}`).join('\n')
+    : `## Open threads\n(empty)`
+
+  const decisionsSection = decisionRows.length
+    ? `## Recent decisions (last 7 days)\n` + (decisionRows as any[]).map(d =>
+        `- **${d.decided_at}**${d.project ? ` (${d.project})` : ''}: ${d.decision_text}`
+      ).join('\n')
+    : `## Recent decisions (last 7 days)\n(empty)`
+
+  const conflictsSection = scoredConflicts.length
+    ? `## Flagged conflicts (by urgency)\n` + scoredConflicts.map(c =>
+        `- [urgency ${c.urgency.toFixed(2)}${c.project ? ` | ${c.project}` : ''}] ${c.content}`
+      ).join('\n')
+    : `## Flagged conflicts\n(empty)`
+
+  const questionsSection = questionRows.length
+    ? `## Recurring questions (ask_count ≥ 3)\n` + (questionRows as any[]).map(q =>
+        `- **(×${q.ask_count})**${q.project ? ` [${q.project}]` : ''} ${q.question_text}`
+      ).join('\n')
+    : `## Recurring questions (ask_count ≥ 3)\n(empty)`
+
+  const deadEndSection = project
+    ? (deadEndHits.length
+      ? `## Dead-end memory — ${project}\n` + deadEndHits.map(h =>
+          `- **${h.session_date}**: tried *${h.approach}* — abandoned because ${h.reason_failed}`
+        ).join('\n')
+      : `## Dead-end memory — ${project}\n(empty)`)
+    : ''
+
+  // ─── Summary header ─────────────────────────────────────────────────────
+  const summaryParts = [
+    `hot: ${hotContextRows.length}`,
+    `last session: ${lastSessionRows.length ? (lastSessionRows[0] as any).session_date : 'none'}`,
+    `open threads: ${openThreads.length}`,
+    `decisions: ${decisionRows.length}`,
+    `conflicts: ${scoredConflicts.length}`,
+    `questions: ${questionRows.length}`,
+    `base notes: ${basePaths.length}`,
+    `project briefs: ${allProjects.length}`,
+  ]
+  if (project) {
+    summaryParts.push(`${project} deep-load: ${projectPaths.length}`)
+    summaryParts.push(`dead-ends: ${deadEndHits.length}`)
+  }
+  const header = `# Session Context — ${today}${project ? ` (+ ${project} deep-load)` : ''}\n${summaryParts.join(' | ')}`
+
+  // ─── Assemble final output ──────────────────────────────────────────────
+  const baseNotesBlock = baseNotes.length
+    ? `\n\n# Base orientation (from manifest)` + baseNotes.join('')
+    : ''
+
+  const projectDeepLoadBlock = (project && projectDeepLoadNotes.length)
+    ? `\n\n# ${project} deep-load (from manifest)` + projectDeepLoadNotes.join('')
+    : ''
+
+  const briefBlock = '\n\n# Project briefs\n' + briefResults.join('')
+
+  const fullContext = [
+    header,
+    baseNotesBlock,
+    '\n\n' + hotContextSection,
+    '\n\n' + lastSessionSection,
+    '\n\n' + openThreadsSection,
+    '\n\n' + decisionsSection,
+    '\n\n' + conflictsSection,
+    '\n\n' + questionsSection,
+    briefBlock,
+    projectDeepLoadBlock,
+    deadEndSection ? '\n\n' + deadEndSection : '',
+  ].join('')
 
   return { content: [{ type: "text", text: fullContext }] }
 })
