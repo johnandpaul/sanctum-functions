@@ -809,7 +809,7 @@ async function internalSynthesizeThinking(
         id: n.id,
         path: n.path,
         title: n.title,
-        date: updated ?? n.created_at ?? null,
+        date: n.created_at ?? updated ?? null,
       })
     }
   }
@@ -854,7 +854,7 @@ async function internalSynthesizeThinking(
       .in('id', relatedEntries.map(r => r.related_id))
     for (const n of (rows ?? []) as Array<{ id: string; created_at: string | null; updated_at: string | null }>) {
       const updated = n.updated_at ? n.updated_at.split('T')[0] : null
-      relatedDateById.set(n.id, updated ?? n.created_at ?? null)
+      relatedDateById.set(n.id, n.created_at ?? updated ?? null)
     }
   }
 
